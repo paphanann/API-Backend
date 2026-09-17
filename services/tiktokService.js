@@ -374,27 +374,39 @@ function normalizeProduct(product) {
   };
 }
 
-async function fetchOrders(connection) {
-  const now = Math.floor(Date.now() / 1000);
-  const from = now - 7 * 24 * 60 * 60;
+const { resolveSyncWindow } = require("../utils/syncWindow");
+
+async function fetchOrders(connection, options = {}) {
+  const window = resolveSyncWindow(connection, {
+    maxMs: 7 * 24 * 60 * 60 * 1000,
+    firstMs: 7 * 24 * 60 * 60 * 1000,
+    ...options.window,
+  });
+
   const orders = [];
   let pageToken = "";
 
   for (let page = 0; page < 10; page += 1) {
-    // TikTok 202309: page_size / page_token ต้องอยู่ใน query ไม่ใช่ body
     const query = { page_size: 50 };
     if (pageToken) {
       query.page_token = pageToken;
     }
 
+    const body = window.incremental
+      ? {
+          update_time_ge: window.sinceSec,
+          update_time_lt: window.untilSec,
+        }
+      : {
+          create_time_ge: window.sinceSec,
+          create_time_lt: window.untilSec,
+        };
+
     const data = await tiktokRequest("POST", "/order/202309/orders/search", {
       accessToken: connection.accessToken,
       shopCipher: connection.shopCipher,
       query,
-      body: {
-        create_time_ge: from,
-        create_time_lt: now,
-      },
+      body,
     });
 
     const list = (data && data.orders) || [];
@@ -411,7 +423,13 @@ async function fetchOrders(connection) {
   return orders;
 }
 
-async function fetchProducts(connection) {
+async function fetchProducts(connection, options = {}) {
+  const window = resolveSyncWindow(connection, {
+    maxMs: 30 * 24 * 60 * 60 * 1000,
+    firstMs: 30 * 24 * 60 * 60 * 1000,
+    ...options.window,
+  });
+
   const products = [];
   let pageToken = "";
 
@@ -421,11 +439,17 @@ async function fetchProducts(connection) {
       query.page_token = pageToken;
     }
 
+    const body = {};
+    if (window.incremental) {
+      body.update_time_ge = window.sinceSec;
+      body.update_time_lt = window.untilSec;
+    }
+
     const data = await tiktokRequest("POST", "/product/202309/products/search", {
       accessToken: connection.accessToken,
       shopCipher: connection.shopCipher,
       query,
-      body: {},
+      body,
     });
 
     const list = (data && data.products) || [];

@@ -19,6 +19,7 @@ const tiktokService = require("./services/tiktokService");
 const lazadaService = require("./services/lazadaService");
 const { ensureSchema } = require("./services/schema");
 const { startTokenRefreshJob } = require("./services/tokenRefreshJob");
+const { startOrderSyncJob } = require("./services/orderSyncJob");
 
 const app = express();
 
@@ -54,6 +55,7 @@ app.use(
 );
 
 
+
 app.use(express.json());
 
 app.get("/", (req, res) => {
@@ -84,6 +86,8 @@ ensureSchema().catch((error) => {
   console.error("Schema ensure failed:", error.message);
 });
 
+
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
@@ -99,4 +103,5 @@ app.listen(PORT, "0.0.0.0", () => {
       .join(", ") || "none"
   );
   startTokenRefreshJob();
+  startOrderSyncJob();
 });

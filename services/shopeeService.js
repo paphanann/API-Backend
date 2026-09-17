@@ -287,18 +287,25 @@ function normalizeProduct(item) {
   };
 }
 
-async function fetchOrders(connection) {
-  const now = Math.floor(Date.now() / 1000);
-  const from = now - 14 * 24 * 60 * 60;
+const { resolveSyncWindow } = require("../utils/syncWindow");
+
+async function fetchOrders(connection, options = {}) {
+  const window = resolveSyncWindow(connection, {
+    maxMs: 14 * 24 * 60 * 60 * 1000,
+    firstMs: 14 * 24 * 60 * 60 * 1000,
+    ...options.window,
+  });
+
+  // รอบถัดไปใช้ update_time เพื่อจับออเดอร์ที่สถานะเปลี่ยน (ไม่ใช่แค่สร้างใหม่)
+  const timeField = window.incremental ? "update_time" : "create_time";
   const orderSns = [];
   let cursor = "";
 
   for (let page = 0; page < 10; page += 1) {
-    // Shopee v2 order list เป็น GET + query (ไม่ใช่ POST body)
     const query = {
-      time_range_field: "create_time",
-      time_from: from,
-      time_to: now,
+      time_range_field: timeField,
+      time_from: window.sinceSec,
+      time_to: window.untilSec,
       page_size: 50,
     };
     if (cursor) {
@@ -349,7 +356,15 @@ async function fetchOrders(connection) {
   return orders;
 }
 
-async function fetchProducts(connection) {
+async function fetchProducts(connection, options = {}) {
+  // Shopee ไม่มี filter ตาม update_time ใน get_item_list
+  // รอบ incremental จึงข้ามดึงสินค้าทั้งหมด เพื่อไม่ให้ Sync = reload ทั้งแคตตาล็อก
+  // (ยกเว้น forceProducts หรือยังไม่เคย sync)
+  const window = resolveSyncWindow(connection, options.window || {});
+  if (window.incremental && !options.forceProducts) {
+    return [];
+  }
+
   const products = [];
   let offset = 0;
 

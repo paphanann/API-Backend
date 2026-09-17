@@ -356,17 +356,27 @@ function normalizeProduct(product) {
   };
 }
 
-async function fetchOrders(connection) {
-  const createdAfter = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-  const data = await lazadaCall(
-    "/orders/get",
-    {
-      created_after: createdAfter,
-      limit: "50",
-      offset: "0",
-    },
-    connection.accessToken
-  );
+const { resolveSyncWindow } = require("../utils/syncWindow");
+
+async function fetchOrders(connection, options = {}) {
+  const window = resolveSyncWindow(connection, {
+    maxMs: 14 * 24 * 60 * 60 * 1000,
+    firstMs: 14 * 24 * 60 * 60 * 1000,
+    ...options.window,
+  });
+
+  const params = {
+    limit: "50",
+    offset: "0",
+  };
+
+  if (window.incremental) {
+    params.update_after = window.sinceLazada;
+  } else {
+    params.created_after = window.sinceLazada;
+  }
+
+  const data = await lazadaCall("/orders/get", params, connection.accessToken);
 
   const list = (data.data && data.data.orders) || data.orders || [];
   const orders = [];
@@ -389,12 +399,25 @@ async function fetchOrders(connection) {
   return orders;
 }
 
-async function fetchProducts(connection) {
-  const data = await lazadaCall(
-    "/products/get",
-    { filter: "all", offset: "0", limit: "50" },
-    connection.accessToken
-  );
+async function fetchProducts(connection, options = {}) {
+  const window = resolveSyncWindow(connection, {
+    maxMs: 30 * 24 * 60 * 60 * 1000,
+    firstMs: 30 * 24 * 60 * 60 * 1000,
+    ...options.window,
+  });
+
+  const params = {
+    filter: "all",
+    offset: "0",
+    limit: "50",
+  };
+
+  // Lazada รองรับ update_after สำหรับดึงสินค้าที่เปลี่ยน
+  if (window.incremental) {
+    params.update_after = window.sinceLazada;
+  }
+
+  const data = await lazadaCall("/products/get", params, connection.accessToken);
 
   const list = (data.data && data.data.products) || [];
   return list.map(normalizeProduct);

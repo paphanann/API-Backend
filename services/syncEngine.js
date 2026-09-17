@@ -7,6 +7,7 @@ const shopeeService = require("./shopeeService");
 const tiktokService = require("./tiktokService");
 const lazadaService = require("./lazadaService");
 const tokenService = require("./tokenService");
+const { resolveSyncWindow } = require("../utils/syncWindow");
 const { publicError } = require("../utils/normalize");
 
 const services = {
@@ -31,7 +32,17 @@ async function pushToSap(order) {
   }
 }
 
-async function syncPlatform(platform) {
+function sapMessage(sap) {
+  if (sap.status === "ok") {
+    return `ซิงก์ออเดอร์แล้ว (SAP DocNum ${sap.docNum})`;
+  }
+  if (sap.status === "error") {
+    return `ซิงก์ออเดอร์แล้ว แต่ SAP ไม่สำเร็จ: ${sap.message || "error"}`;
+  }
+  return "ซิงก์ออเดอร์แล้ว (ยังไม่ได้ตั้งค่า SAP)";
+}
+
+async function syncPlatform(platform, options = {}) {
   const service = services[platform];
 
   if (!service) {
@@ -44,6 +55,7 @@ async function syncPlatform(platform) {
     throw new Error("ยังไม่ได้เชื่อมต่อร้านค้า");
   }
 
+  const window = resolveSyncWindow(connection, options.window);
   const start = Date.now();
   let orderCount = 0;
   let productCount = 0;
@@ -53,14 +65,14 @@ async function syncPlatform(platform) {
   try {
     const ran = await tokenService.runWithFreshTokens(
       connection,
-      (conn, options) => service.ensureFreshTokens(conn, options),
+      (conn, tokenOptions) => service.ensureFreshTokens(conn, tokenOptions),
       async (fresh) => {
         let nextOrderCount = 0;
         let nextProductCount = 0;
         let nextSapOk = 0;
         let nextSapError = 0;
 
-        const orders = await service.fetchOrders(fresh);
+        const orders = await service.fetchOrders(fresh, { window: options.window });
 
         for (const order of orders) {
           if (!order.marketplaceOrderId) {
@@ -76,9 +88,22 @@ async function syncPlatform(platform) {
           } else if (sap.status === "error") {
             nextSapError += 1;
           }
+
+          await syncLogStore.writeLog({
+            connectionId: connection.id,
+            platform,
+            syncType: "order",
+            status: sap.status === "error" ? "error" : "success",
+            message: sapMessage(sap),
+            orderCount: 1,
+            productCount: 0,
+            marketplaceOrderId: order.marketplaceOrderId,
+            sapDocNum: sap.docNum || null,
+            errorMessage: sap.status === "error" ? sap.message : null,
+          });
         }
 
-        const products = await service.fetchProducts(fresh);
+        const products = await service.fetchProducts(fresh, { window: options.window });
         for (const product of products) {
           if (!product.productId) {
             continue;
@@ -90,9 +115,10 @@ async function syncPlatform(platform) {
 
         await connectionStore.touchSync(fresh);
 
+        const mode = window.incremental ? "เฉพาะที่เปลี่ยน" : "รอบแรก";
         const message = sapService.isConfigured()
-          ? `ออเดอร์ ${nextOrderCount} รายการ สินค้า ${nextProductCount} รายการ SAP สำเร็จ ${nextSapOk} ล้มเหลว ${nextSapError}`
-          : `ออเดอร์ ${nextOrderCount} รายการ สินค้า ${nextProductCount} รายการ (ยังไม่ได้ตั้งค่า SAP)`;
+          ? `${mode}: ออเดอร์ ${nextOrderCount} สินค้า ${nextProductCount} (SAP สำเร็จ ${nextSapOk} ล้มเหลว ${nextSapError})`
+          : `${mode}: ออเดอร์ ${nextOrderCount} สินค้า ${nextProductCount}`;
 
         return {
           message,
@@ -100,6 +126,7 @@ async function syncPlatform(platform) {
           productCount: nextProductCount,
           sapOk: nextSapOk,
           sapError: nextSapError,
+          incremental: window.incremental,
         };
       }
     );
@@ -109,27 +136,36 @@ async function syncPlatform(platform) {
     sapOk = ran.result.sapOk;
     sapError = ran.result.sapError;
     const message = ran.result.message;
+    const noop =
+      window.incremental &&
+      orderCount === 0 &&
+      productCount === 0 &&
+      sapError === 0;
 
-    await syncLogStore.writeLog({
-      connectionId: connection.id,
-      platform,
-      syncType: "orders",
-      status: sapError ? "partial" : "success",
-      message,
-      orderCount,
-      productCount,
-      errorMessage: sapError ? `SAP ไม่สำเร็จ ${sapError} รายการ` : null,
-    });
+    // มีออเดอร์แล้วเขียนทีละเลขด้านบน — เขียนสรุปเฉพาะตอนมีแต่สินค้า หรือรอบเต็มที่ไม่มีออเดอร์
+    if (!noop && orderCount === 0 && productCount > 0) {
+      await syncLogStore.writeLog({
+        connectionId: connection.id,
+        platform,
+        syncType: window.incremental ? "incremental" : "full",
+        status: "success",
+        message,
+        orderCount: 0,
+        productCount,
+      });
+    }
 
     return {
       success: true,
       platform,
+      incremental: window.incremental,
+      noop,
       durationMs: Date.now() - start,
       orderCount,
       productCount,
       sapOk,
       sapError,
-      message,
+      message: noop ? "ไม่มีการเปลี่ยนแปลง" : message,
     };
   } catch (error) {
     const message = publicError(error, "ซิงก์ไม่สำเร็จ");
@@ -137,7 +173,7 @@ async function syncPlatform(platform) {
     await syncLogStore.writeLog({
       connectionId: connection.id,
       platform,
-      syncType: "orders",
+      syncType: window.incremental ? "incremental" : "full",
       status: "error",
       message,
       errorMessage: message,
@@ -151,4 +187,8 @@ async function syncPlatform(platform) {
 
 module.exports = {
   syncPlatform,
+  syncAllConnected: async () => {
+    const { syncAllConnected } = require("./orderSyncJob");
+    return syncAllConnected();
+  },
 };

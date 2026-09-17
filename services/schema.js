@@ -13,6 +13,16 @@ async function ensureSchema() {
     IF COL_LENGTH('dbo.MarketplaceOrder', 'ItemsJson') IS NULL
       ALTER TABLE dbo.MarketplaceOrder ADD ItemsJson NVARCHAR(MAX) NULL;
 
+    IF OBJECT_ID(N'dbo.SyncLog', N'U') IS NOT NULL
+    BEGIN
+      IF COL_LENGTH('dbo.SyncLog', 'MarketplaceOrderId') IS NULL
+        ALTER TABLE dbo.SyncLog ADD MarketplaceOrderId NVARCHAR(100) NULL;
+      IF COL_LENGTH('dbo.SyncLog', 'SapDocNum') IS NULL
+        ALTER TABLE dbo.SyncLog ADD SapDocNum NVARCHAR(50) NULL;
+      IF COL_LENGTH('dbo.SyncLog', 'SapDocEntry') IS NULL
+        ALTER TABLE dbo.SyncLog ADD SapDocEntry NVARCHAR(50) NULL;
+    END
+
     IF OBJECT_ID(N'dbo.MarketplaceConnection', N'U') IS NULL
     BEGIN
       CREATE TABLE dbo.MarketplaceConnection
