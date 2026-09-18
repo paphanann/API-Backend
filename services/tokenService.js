@@ -192,8 +192,22 @@ async function saveTokens({
     .input("refreshExpire", sql.DateTime2, refreshTokenExpireAt || null)
     .input("shopCipher", sql.NVarChar(500), shopCipher || null)
     .query(`
+      DECLARE @id INT =
+      (
+        SELECT TOP 1 ConnectionId
+        FROM dbo.MarketplaceConnection
+        WHERE Platform = @platform
+        ORDER BY UpdatedAt DESC, ConnectionId DESC
+      );
+
+      IF @id IS NULL
+      BEGIN
+        RAISERROR(N'ไม่พบแถว MarketplaceConnection สำหรับแพลตฟอร์มนี้', 16, 1);
+      END
+
       UPDATE dbo.MarketplaceConnection
       SET
+        ShopId = @shopId,
         AccessToken = @accessToken,
         RefreshToken = COALESCE(@refreshToken, RefreshToken),
         AccessTokenExpiresAt = @accessExpire,
@@ -202,8 +216,11 @@ async function saveTokens({
         ConnectionStatus = N'CONNECTED',
         LastRefreshAt = GETDATE(),
         UpdatedAt = GETDATE()
+      WHERE ConnectionId = @id;
+
+      DELETE FROM dbo.MarketplaceConnection
       WHERE Platform = @platform
-        AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
+        AND ConnectionId <> @id;
     `);
 
   const rowsUpdated = Number((updated.rowsAffected && updated.rowsAffected[0]) || 0);
@@ -211,7 +228,6 @@ async function saveTokens({
   const verifyResult = await pool
     .request()
     .input("platform", sql.NVarChar(50), key.platform)
-    .input("shopId", sql.NVarChar(100), key.shopId)
     .query(`
       SELECT TOP 1
         CASE WHEN AccessToken IS NOT NULL AND LEN(AccessToken) > 0 THEN 1 ELSE 0 END AS HasAccessToken,
@@ -219,7 +235,7 @@ async function saveTokens({
         AccessTokenExpiresAt
       FROM dbo.MarketplaceConnection
       WHERE Platform = @platform
-        AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
+      ORDER BY UpdatedAt DESC
     `);
 
   const verify = verifyResult.recordset && verifyResult.recordset[0];
@@ -301,12 +317,19 @@ async function clearTokens(platform) {
         RefreshToken = NULL,
         AccessTokenExpiresAt = NULL,
         RefreshTokenExpiresAt = NULL,
+        ShopCipher = NULL,
+        ShopId = NULL,
+        ShopName = NULL,
+        SellerId = NULL,
+        AuthorizedAt = NULL,
+        LastSyncAt = NULL,
+        LastRefreshAt = NULL,
         ConnectionStatus = N'DISCONNECTED',
         UpdatedAt = GETDATE()
       WHERE Platform = @platform
     `);
 
-  console.log(`Cleared marketplace tokens: ${platform}`);
+  console.log(`Cleared marketplace connection: ${platform}`);
 }
 
 function revealTokens(row) {

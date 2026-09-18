@@ -118,7 +118,9 @@ async function syncAllConnected(options = {}) {
       summary.checked += 1;
 
       try {
-        const result = await syncEngine.syncPlatform(platform);
+        const result = await syncEngine.syncPlatform(platform, {
+          forceProducts: Boolean(options.forceProducts),
+        });
         if (result.noop) {
           summary.noop += 1;
         } else {

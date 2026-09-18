@@ -210,14 +210,23 @@ async function completeOAuth(query) {
     throw new Error("TikTok ไม่ได้ส่งรหัสอนุญาตกลับมา");
   }
 
-  const tokens = await exchangeCodeForToken(code);
+  let tokens;
+  try {
+    tokens = await exchangeCodeForToken(code);
+  } catch (error) {
+    throw new Error(
+      `แลก token จาก TikTok ไม่สำเร็จ: ${error.message || error}. ตรวจ Redirect URL ใน Partner Center ว่าตรงกับ TIKTOK_REDIRECT_URL ใน .env`
+    );
+  }
+
   if (!tokens || !tokens.access_token) {
-    throw new Error("แลก token จาก TikTok ไม่สำเร็จ");
+    throw new Error("แลก token จาก TikTok ไม่สำเร็จ (ไม่มี access_token)");
   }
 
   let shopId = text(tokens.seller_id || tokens.open_id || tokens.shop_id, "tiktok");
   let shopName = text(tokens.seller_name || tokens.shop_name);
   let shopCipher = text(tokens.shop_cipher);
+  let shopsError = null;
 
   try {
     const shops = await getAuthorizedShops(tokens.access_token);
@@ -225,9 +234,12 @@ async function completeOAuth(query) {
       shopId = text(shops[0].id || shops[0].shop_id, shopId);
       shopName = text(shops[0].name || shops[0].shop_name, shopName);
       shopCipher = text(shops[0].cipher, shopCipher);
+    } else {
+      shopsError = "ไม่พบร้านใน authorization/shops";
     }
-  } catch {
-    // token ยังใช้ดึงร้านไม่ได้ ก็เก็บจากข้อมูล token ไปก่อน
+  } catch (error) {
+    shopsError = error.message || String(error);
+    console.warn("TikTok getAuthorizedShops failed:", shopsError);
   }
 
   await saveShopConnection({
@@ -240,6 +252,20 @@ async function completeOAuth(query) {
     accessTokenExpireAt: expiryDate(tokens.access_token_expire_in),
     refreshTokenExpireAt: expiryDate(tokens.refresh_token_expire_in),
   });
+
+  console.log(
+    `TikTok OAuth saved shop=${shopId} cipher=${shopCipher ? "yes" : "NO"} shopsError=${shopsError || "-"}`
+  );
+
+  if (!shopCipher) {
+    // บันทึก token แล้ว แต่ยัง sync ไม่ได้จนกว่าจะได้ cipher
+    const err = new Error(
+      "เชื่อมต่อแล้วแต่ยังไม่มี shop_cipher — เปิด scope authorization.shop (และสิทธิ์ร้าน) ใน TikTok Partner Center แล้วกดเชื่อมต่อใหม่"
+    );
+    err.code = "MISSING_SHOP_CIPHER";
+    err.partialSuccess = true;
+    throw err;
+  }
 
   return { shopId, shopName };
 }
@@ -359,18 +385,73 @@ function normalizeOrder(order) {
   };
 }
 
+function pickTiktokImage(product) {
+  const mains = product.main_images || product.main_image || [];
+  const list = Array.isArray(mains) ? mains : [mains];
+  for (const img of list) {
+    if (!img) continue;
+    if (typeof img === "string") return img;
+    const urls = img.urls || img.url_list || img.thumb_urls || [];
+    if (Array.isArray(urls) && urls[0]) return urls[0];
+    if (img.url) return img.url;
+    if (img.thumb_url) return img.thumb_url;
+  }
+
+  // fallback: sku attribute image
+  const skus = Array.isArray(product.skus) ? product.skus : [];
+  for (const sku of skus) {
+    const attrs = Array.isArray(sku.sales_attributes) ? sku.sales_attributes : [];
+    for (const attr of attrs) {
+      const skuImg = attr && attr.sku_img;
+      if (!skuImg) continue;
+      if (typeof skuImg === "string") return skuImg;
+      const urls = skuImg.urls || skuImg.thumb_urls || [];
+      if (Array.isArray(urls) && urls[0]) return urls[0];
+      if (skuImg.url) return skuImg.url;
+    }
+  }
+  return null;
+}
+
 function normalizeProduct(product) {
-  const sku = (product.skus && product.skus[0]) || {};
-  const price = sku.price && (sku.price.sale_price || sku.price.tax_exclusive_price);
+  const skus = Array.isArray(product.skus) ? product.skus : [];
+  const imageUrl = pickTiktokImage(product);
+  const variants = skus.map((sku) => {
+    const price = sku.price && (sku.price.sale_price || sku.price.tax_exclusive_price);
+    const stock = Number((sku.inventory && sku.inventory[0] && sku.inventory[0].quantity) || 0);
+    return {
+      sku: text(sku.seller_sku || sku.id || product.id, "-"),
+      modelId: text(sku.id || "", ""),
+      option: text(
+        (Array.isArray(sku.sales_attributes) &&
+          sku.sales_attributes.map((a) => a.value_name || a.name).filter(Boolean).join(" / ")) ||
+          "",
+        ""
+      ),
+      price: money(price),
+      stock,
+      status: mapProductStatus(product.status),
+      imageUrl,
+    };
+  });
+
+  const first = skus[0] || {};
+  const price = first.price && (first.price.sale_price || first.price.tax_exclusive_price);
 
   return {
     platform: "TikTok",
     productId: text(product.id, "-"),
-    sku: text(sku.seller_sku || product.id, "-"),
+    sku: text(first.seller_sku || product.id, "-"),
     name: text(product.title, "-"),
-    price: money(price),
-    stock: Number((sku.inventory && sku.inventory[0] && sku.inventory[0].quantity) || 0),
+    price: variants.length
+      ? Math.min(...variants.map((v) => Number(v.price) || 0))
+      : money(price),
+    stock: variants.length
+      ? variants.reduce((sum, v) => sum + Number(v.stock || 0), 0)
+      : Number((first.inventory && first.inventory[0] && first.inventory[0].quantity) || 0),
     status: mapProductStatus(product.status),
+    imageUrl,
+    variants,
   };
 }
 
@@ -423,6 +504,14 @@ async function fetchOrders(connection, options = {}) {
   return orders;
 }
 
+async function fetchProductDetail(connection, productId) {
+  const data = await tiktokRequest("GET", `/product/202309/products/${productId}`, {
+    accessToken: connection.accessToken,
+    shopCipher: connection.shopCipher,
+  });
+  return data;
+}
+
 async function fetchProducts(connection, options = {}) {
   const window = resolveSyncWindow(connection, {
     maxMs: 30 * 24 * 60 * 60 * 1000,
@@ -440,7 +529,7 @@ async function fetchProducts(connection, options = {}) {
     }
 
     const body = {};
-    if (window.incremental) {
+    if (window.incremental && !options.forceProducts) {
       body.update_time_ge = window.sinceSec;
       body.update_time_lt = window.untilSec;
     }
@@ -453,7 +542,21 @@ async function fetchProducts(connection, options = {}) {
     });
 
     const list = (data && data.products) || [];
-    for (const product of list) {
+    for (const row of list) {
+      const id = row && row.id;
+      if (!id) continue;
+
+      // search ไม่มี main_images — ต้องดึง detail ทีละชิ้น
+      let product = row;
+      try {
+        const detail = await fetchProductDetail(connection, id);
+        if (detail && detail.id) {
+          product = detail;
+        }
+      } catch (err) {
+        console.warn(`TikTok product detail ${id}:`, err.message || err);
+      }
+
       products.push(normalizeProduct(product));
     }
 

@@ -94,9 +94,11 @@ router.get("/callback", async (req, res) => {
     if (error.response && error.response.data) {
       console.error("TikTok token error body:", error.response.data);
     }
+    // token อาจบันทึกแล้วแต่ยังไม่มี shop_cipher — บอกให้ไปเปิด scope
+    const status = error.partialSuccess ? "error" : "error";
     res.redirect(
       frontendConnections(
-        "error",
+        status,
         publicError(error, "เชื่อมต่อ TikTok ไม่สำเร็จ"),
         returnUrl
       )

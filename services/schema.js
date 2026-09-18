@@ -13,6 +13,14 @@ async function ensureSchema() {
     IF COL_LENGTH('dbo.MarketplaceOrder', 'ItemsJson') IS NULL
       ALTER TABLE dbo.MarketplaceOrder ADD ItemsJson NVARCHAR(MAX) NULL;
 
+    IF OBJECT_ID(N'dbo.MarketplaceProduct', N'U') IS NOT NULL
+    BEGIN
+      IF COL_LENGTH('dbo.MarketplaceProduct', 'ImageUrl') IS NULL
+        ALTER TABLE dbo.MarketplaceProduct ADD ImageUrl NVARCHAR(1000) NULL;
+      IF COL_LENGTH('dbo.MarketplaceProduct', 'VariantsJson') IS NULL
+        ALTER TABLE dbo.MarketplaceProduct ADD VariantsJson NVARCHAR(MAX) NULL;
+    END
+
     IF OBJECT_ID(N'dbo.SyncLog', N'U') IS NOT NULL
     BEGIN
       IF COL_LENGTH('dbo.SyncLog', 'MarketplaceOrderId') IS NULL
@@ -65,6 +73,29 @@ async function ensureSchema() {
     UPDATE dbo.MarketplaceConnection
     SET AuthorizedAt = COALESCE(AuthorizedAt, CreatedAt, UpdatedAt)
     WHERE AuthorizedAt IS NULL;
+
+    -- ลบแถวซ้ำ: เหลือแค่ ConnectionId ล่าสุดต่อ Platform (กัน TikTok/Shopee เบิ้ลจาก reconnect)
+    ;WITH ranked AS (
+      SELECT
+        ConnectionId,
+        ROW_NUMBER() OVER (
+          PARTITION BY Platform
+          ORDER BY UpdatedAt DESC, ConnectionId DESC
+        ) AS rn
+      FROM dbo.MarketplaceConnection
+    )
+    DELETE FROM ranked WHERE rn > 1;
+
+    IF NOT EXISTS (
+      SELECT 1
+      FROM sys.indexes
+      WHERE name = N'UX_MarketplaceConnection_Platform'
+        AND object_id = OBJECT_ID(N'dbo.MarketplaceConnection')
+    )
+    BEGIN
+      CREATE UNIQUE INDEX UX_MarketplaceConnection_Platform
+        ON dbo.MarketplaceConnection (Platform);
+    END
 
     -- ย้ายครั้งแรกจากตารางเก่า ถ้าตารางใหม่ยังว่าง
     IF OBJECT_ID(N'dbo.MarketplaceAuthorization', N'U') IS NOT NULL

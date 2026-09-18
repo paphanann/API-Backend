@@ -1,6 +1,21 @@
 const { poolPromise } = require("../config/database");
 const { ensureSchema } = require("./schema");
 
+function variantsJson(product) {
+  const list = Array.isArray(product.variants) ? product.variants : [];
+  return list.length ? JSON.stringify(list) : null;
+}
+
+function parseVariants(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 async function upsertProduct(product) {
   await ensureSchema();
   const pool = await poolPromise;
@@ -14,6 +29,8 @@ async function upsertProduct(product) {
     .input("price", product.price)
     .input("stock", product.stock)
     .input("status", product.status || null)
+    .input("imageUrl", product.imageUrl || null)
+    .input("variantsJson", variantsJson(product))
     .query(`
       IF EXISTS (
         SELECT 1
@@ -29,6 +46,8 @@ async function upsertProduct(product) {
           Price = @price,
           Stock = @stock,
           Status = @status,
+          ImageUrl = COALESCE(@imageUrl, ImageUrl),
+          VariantsJson = COALESCE(@variantsJson, VariantsJson),
           SyncedAt = GETDATE()
         WHERE Platform = @platform
           AND ProductId = @productId
@@ -44,6 +63,8 @@ async function upsertProduct(product) {
           Price,
           Stock,
           Status,
+          ImageUrl,
+          VariantsJson,
           SyncedAt
         )
         VALUES
@@ -55,6 +76,8 @@ async function upsertProduct(product) {
           @price,
           @stock,
           @status,
+          @imageUrl,
+          @variantsJson,
           GETDATE()
         )
       END
@@ -76,7 +99,10 @@ async function listProducts(platform) {
       Price,
       Stock,
       Status,
-      SyncedAt
+      ImageUrl,
+      VariantsJson,
+      SyncedAt,
+      SyncedAt AS UpdatedAt
     FROM dbo.MarketplaceProduct
   `;
 
@@ -87,7 +113,15 @@ async function listProducts(platform) {
 
   query += " ORDER BY SyncedAt DESC";
   const result = await request.query(query);
-  return result.recordset;
+  return result.recordset.map((row) => {
+    const variants = parseVariants(row.VariantsJson);
+    const { VariantsJson, ...rest } = row;
+    return {
+      ...rest,
+      Variants: variants,
+      variants,
+    };
+  });
 }
 
 module.exports = {

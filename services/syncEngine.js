@@ -103,7 +103,10 @@ async function syncPlatform(platform, options = {}) {
           });
         }
 
-        const products = await service.fetchProducts(fresh, { window: options.window });
+        const products = await service.fetchProducts(fresh, {
+          window: options.window,
+          forceProducts: Boolean(options.forceProducts),
+        });
         for (const product of products) {
           if (!product.productId) {
             continue;

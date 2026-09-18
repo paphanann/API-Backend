@@ -51,7 +51,12 @@ router.post("/now", async (req, res) => {
     const force =
       String(req.query.force || req.body?.force || "").trim() === "1" ||
       req.body?.force === true;
-    const summary = await syncAllConnected({ force });
+    // Sync Now always reloads products (Shopee skips product fetch on incremental otherwise)
+    const forceProducts =
+      force ||
+      String(req.query.forceProducts || req.body?.forceProducts || "1").trim() === "1" ||
+      req.body?.forceProducts === true;
+    const summary = await syncAllConnected({ force, forceProducts });
     res.json({
       success: true,
       message: summary.skipped
@@ -89,7 +94,12 @@ router.post("/:platform", async (req, res) => {
   const platform = normalizePlatform(req.params.platform);
 
   try {
-    const result = await syncEngine.syncPlatform(platform);
+    const forceProducts =
+      String(req.query.forceProducts || req.body?.forceProducts || "").trim() === "1" ||
+      req.body?.forceProducts === true ||
+      String(req.query.force || req.body?.force || "").trim() === "1" ||
+      req.body?.force === true;
+    const result = await syncEngine.syncPlatform(platform, { forceProducts });
     res.json(result);
   } catch (error) {
     console.error(error);

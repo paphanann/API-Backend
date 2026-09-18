@@ -46,6 +46,8 @@ async function saveConnection(fields) {
   const userId = fields.userId || defaultUserId();
   const sellerId = fields.sellerId || fields.openId || null;
 
+  // ระบบนี้เก็บ 1 ร้านต่อแพลตฟอร์ม — upsert ตาม Platform อย่างเดียว
+  // (reconnect แล้ว ShopId เปลี่ยน จะอัปเดตแถวเดิม ไม่สร้างแถวใหม่ที่ไม่มี token)
   await pool
     .request()
     .input("userId", sql.Int, userId)
@@ -55,24 +57,32 @@ async function saveConnection(fields) {
     .input("shopCipher", sql.NVarChar(500), fields.shopCipher || null)
     .input("sellerId", sql.NVarChar(200), sellerId)
     .query(`
-      IF EXISTS (
-        SELECT 1
+      DECLARE @id INT =
+      (
+        SELECT TOP 1 ConnectionId
         FROM dbo.MarketplaceConnection
         WHERE Platform = @platform
-          AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
-      )
+        ORDER BY UpdatedAt DESC, ConnectionId DESC
+      );
+
+      IF @id IS NOT NULL
       BEGIN
         UPDATE dbo.MarketplaceConnection
         SET
           UserId = @userId,
+          ShopId = @shopId,
           ShopName = COALESCE(@shopName, ShopName),
           ShopCipher = COALESCE(@shopCipher, ShopCipher),
           SellerId = COALESCE(@sellerId, SellerId),
           ConnectionStatus = N'CONNECTED',
           AuthorizedAt = GETDATE(),
           UpdatedAt = GETDATE()
+        WHERE ConnectionId = @id;
+
+        -- ลบแถวซ้ำของแพลตฟอร์มเดียวกัน (กันข้อมูลเบิ้ลจาก reconnect เก่า)
+        DELETE FROM dbo.MarketplaceConnection
         WHERE Platform = @platform
-          AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
+          AND ConnectionId <> @id;
       END
       ELSE
       BEGIN
@@ -314,6 +324,8 @@ async function listPublicConnections() {
       Message: tiktokMissingCipher
         ? "TikTok ยังไม่มี shop_cipher — เปิด scope ใน Partner Center แล้ว Connect ใหม่"
         : null,
+      // ให้หน้าบ้านรู้ว่าตัดการเชื่อมแล้วจริง ไม่โชว์ชื่อร้านค้างเป็น needsReauth
+      Cleared: connected || needsReauth ? 0 : 1,
     });
   }
 

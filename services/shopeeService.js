@@ -275,15 +275,101 @@ function normalizeOrder(detail) {
   };
 }
 
-function normalizeProduct(item) {
+function pickShopeeImage(item) {
+  const list =
+    (item.image && (item.image.image_url_list || item.image.image_url)) ||
+    item.image_url_list ||
+    item.images ||
+    (item.image && item.image.image_list) ||
+    [];
+  const urls = Array.isArray(list) ? list : list ? [list] : [];
+  for (const first of urls) {
+    if (!first) continue;
+    if (typeof first === "string" && first.trim()) return first.trim();
+    const url = first.image_url || first.url || first.image;
+    if (url) return url;
+  }
+
+  const single =
+    (typeof item.image === "string" && item.image) ||
+    item.image_url ||
+    item.cover_image ||
+    null;
+  if (single) return single;
+
+  const ids = (item.image && item.image.image_id_list) || item.image_id_list || [];
+  const id = Array.isArray(ids) ? ids[0] : null;
+  if (id) return `https://cf.shopee.co.th/file/${id}`;
+  return null;
+}
+
+function tierOptionLabel(tierVariation, tierIndex) {
+  if (!Array.isArray(tierVariation) || !Array.isArray(tierIndex)) return "";
+  const parts = [];
+  for (let i = 0; i < tierIndex.length; i += 1) {
+    const tier = tierVariation[i];
+    const idx = tierIndex[i];
+    const option =
+      tier &&
+      Array.isArray(tier.option_list) &&
+      tier.option_list[idx] &&
+      (tier.option_list[idx].option || tier.option_list[idx].name);
+    if (option) parts.push(String(option));
+  }
+  return parts.join(" / ");
+}
+
+function normalizeProduct(item, modelsPayload = null) {
+  const imageUrl = pickShopeeImage(item);
+  const models = (modelsPayload && modelsPayload.model) || [];
+  const tierVariation = (modelsPayload && modelsPayload.tier_variation) || [];
+
+  const variants = models.map((model) => {
+    const priceInfo = (model.price_info && model.price_info[0]) || model.price_info || {};
+    const stockInfo =
+      (model.stock_info_v2 &&
+        model.stock_info_v2.summary_info &&
+        model.stock_info_v2.summary_info.total_available_stock) ||
+      (Array.isArray(model.stock_info) && model.stock_info[0] && model.stock_info[0].normal_stock) ||
+      0;
+
+    return {
+      sku: text(model.model_sku, ""),
+      modelId: String(model.model_id || ""),
+      option: tierOptionLabel(tierVariation, model.tier_index) || text(model.model_name, ""),
+      price: money(
+        priceInfo.current_price ||
+          priceInfo.original_price ||
+          (item.price_info && item.price_info.current_price)
+      ),
+      stock: Number(stockInfo || 0),
+      status: mapProductStatus(item.item_status),
+      imageUrl,
+    };
+  });
+
+  const priceFromParent = money(item.price_info && item.price_info.current_price);
+  const stockFromParent = Number(
+    (item.stock_info_v2 &&
+      item.stock_info_v2.summary_info &&
+      item.stock_info_v2.summary_info.total_available_stock) ||
+      0
+  );
+
   return {
     platform: "Shopee",
     productId: String(item.item_id),
     sku: text(item.item_sku || item.item_id, "-"),
     name: text(item.item_name, "-"),
-    price: money(item.price_info && item.price_info.current_price),
-    stock: Number((item.stock_info_v2 && item.stock_info_v2.summary_info && item.stock_info_v2.summary_info.total_available_stock) || 0),
+    price: variants.length
+      ? Math.min(...variants.map((v) => Number(v.price) || 0))
+      : priceFromParent,
+    stock: variants.length
+      ? variants.reduce((sum, v) => sum + Number(v.stock || 0), 0)
+      : stockFromParent,
     status: mapProductStatus(item.item_status),
+    imageUrl,
+    variants,
   };
 }
 
@@ -388,7 +474,19 @@ async function fetchProducts(connection, options = {}) {
       });
       const items = (detail.response && detail.response.item_list) || [];
       for (const item of items) {
-        products.push(normalizeProduct(item));
+        let modelsPayload = null;
+        if (item.has_model) {
+          try {
+            const models = await shopeeRequest("GET", "/api/v2/product/get_model_list", {
+              connection,
+              query: { item_id: item.item_id },
+            });
+            modelsPayload = models.response || null;
+          } catch (error) {
+            console.warn(`Shopee get_model_list failed for ${item.item_id}:`, error.message);
+          }
+        }
+        products.push(normalizeProduct(item, modelsPayload));
       }
     }
 

@@ -342,17 +342,59 @@ function normalizeOrder(order) {
   };
 }
 
-function normalizeProduct(product) {
-  const sku = (product.skus && product.skus[0]) || {};
+function pickLazadaImage(product, sku) {
+  const fromProduct = Array.isArray(product.images) ? product.images[0] : null;
+  const fromSku = Array.isArray(sku.Images)
+    ? sku.Images[0]
+    : Array.isArray(sku.images)
+      ? sku.images[0]
+      : null;
+  const raw =
+    fromProduct ||
+    fromSku ||
+    product.main_image ||
+    product.image ||
+    (typeof sku.Images === "string" ? sku.Images.split(",")[0] : null) ||
+    null;
+  if (!raw) return null;
+  if (typeof raw === "string") return raw.trim() || null;
+  return raw.url || raw.image || raw.Image || null;
+}
 
+function normalizeProduct(product) {
+  const skus = Array.isArray(product.skus) ? product.skus : [];
+  const imageUrl = pickLazadaImage(product, skus[0] || {});
+  const variants = skus.map((sku) => ({
+    sku: text(sku.SellerSku || sku.ShopSku || product.item_id, "-"),
+    modelId: text(sku.SkuId || sku.sku_id || "", ""),
+    option: text(
+      (sku.saleProp && Object.values(sku.saleProp).join(" / ")) ||
+        sku.Status ||
+        sku.SellerSku ||
+        "",
+      ""
+    ),
+    price: money(sku.price || sku.special_price),
+    stock: Number(sku.quantity || 0),
+    status: mapProductStatus(product.status),
+    imageUrl: pickLazadaImage(product, sku) || imageUrl,
+  }));
+
+  const first = skus[0] || {};
   return {
     platform: "Lazada",
     productId: text(product.item_id, "-"),
-    sku: text(sku.SellerSku || sku.ShopSku || product.item_id, "-"),
+    sku: text(first.SellerSku || first.ShopSku || product.item_id, "-"),
     name: text(product.attributes && product.attributes.name, "-"),
-    price: money(sku.price),
-    stock: Number(sku.quantity || 0),
+    price: variants.length
+      ? Math.min(...variants.map((v) => Number(v.price) || 0))
+      : money(first.price),
+    stock: variants.length
+      ? variants.reduce((sum, v) => sum + Number(v.stock || 0), 0)
+      : Number(first.quantity || 0),
     status: mapProductStatus(product.status),
+    imageUrl,
+    variants,
   };
 }
 
@@ -412,8 +454,8 @@ async function fetchProducts(connection, options = {}) {
     limit: "50",
   };
 
-  // Lazada รองรับ update_after สำหรับดึงสินค้าที่เปลี่ยน
-  if (window.incremental) {
+  // Lazada รองรับ update_after สำหรับดึงสินค้าที่เปลี่ยน (ข้ามเมื่อ forceProducts)
+  if (window.incremental && !options.forceProducts) {
     params.update_after = window.sinceLazada;
   }
 

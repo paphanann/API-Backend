@@ -58,6 +58,15 @@ app.use(
 
 app.use(express.json());
 
+// ngrok free บางทีโชว์หน้าเตือนจน OAuth callback พัง — ข้ามสำหรับ path callback
+app.use((req, res, next) => {
+  if (String(req.path || "").includes("/callback")) {
+    res.setHeader("ngrok-skip-browser-warning", "1");
+    req.headers["ngrok-skip-browser-warning"] = "1";
+  }
+  next();
+});
+
 app.get("/", (req, res) => {
   res.json({
     message: "PASS Marketplace Backend",
