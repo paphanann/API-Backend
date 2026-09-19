@@ -12,14 +12,14 @@ const productRoutes = require("./routes/productRoutes");
 const inventoryRoutes = require("./routes/inventoryRoutes");
 const syncRoutes = require("./routes/syncRoutes");
 const authRoutes = require("./routes/authRoutes");
-const tiktokRoutes = require("./routes/tiktokRoutes");
-const lazadaRoutes = require("./routes/lazadaRoutes");
-const shopeeService = require("./services/shopeeService");
-const tiktokService = require("./services/tiktokService");
-const lazadaService = require("./services/lazadaService");
-const { ensureSchema } = require("./services/schema");
-const { startTokenRefreshJob } = require("./services/tokenRefreshJob");
-const { startOrderSyncJob } = require("./services/orderSyncJob");
+const tiktokRoutes = require("./routes/oauth/tiktokRoutes");
+const lazadaRoutes = require("./routes/oauth/lazadaRoutes");
+const shopeeService = require("./services/marketplaces/shopeeService");
+const tiktokService = require("./services/marketplaces/tiktokService");
+const lazadaService = require("./services/marketplaces/lazadaService");
+const { ensureSchema } = require("./services/stores/schema");
+const { startTokenRefreshJob } = require("./services/sync/tokenRefreshJob");
+const { startOrderSyncJob } = require("./services/sync/orderSyncJob");
 
 const app = express();
 

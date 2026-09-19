@@ -1,7 +1,7 @@
 const https = require("https");
 const axios = require("axios");
 
-const { text } = require("../utils/normalize");
+const { text } = require("../../utils/normalize");
 
 function getConfig() {
   return {

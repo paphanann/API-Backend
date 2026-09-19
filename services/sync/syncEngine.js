@@ -1,14 +1,14 @@
-const connectionStore = require("./connectionStore");
-const orderStore = require("./orderStore");
-const productStore = require("./productStore");
-const syncLogStore = require("./syncLogStore");
-const sapService = require("./sapService");
-const shopeeService = require("./shopeeService");
-const tiktokService = require("./tiktokService");
-const lazadaService = require("./lazadaService");
-const tokenService = require("./tokenService");
-const { resolveSyncWindow } = require("../utils/syncWindow");
-const { publicError } = require("../utils/normalize");
+const connectionStore = require("../stores/connectionStore");
+const orderStore = require("../stores/orderStore");
+const productStore = require("../stores/productStore");
+const syncLogStore = require("../stores/syncLogStore");
+const sapService = require("../marketplaces/sapService");
+const shopeeService = require("../marketplaces/shopeeService");
+const tiktokService = require("../marketplaces/tiktokService");
+const lazadaService = require("../marketplaces/lazadaService");
+const tokenService = require("../tokenService");
+const { resolveSyncWindow } = require("../../utils/syncWindow");
+const { publicError } = require("../../utils/normalize");
 
 const services = {
   Shopee: shopeeService,
@@ -107,13 +107,27 @@ async function syncPlatform(platform, options = {}) {
           window: options.window,
           forceProducts: Boolean(options.forceProducts),
         });
+        const keptIds = [];
         for (const product of products) {
           if (!product.productId) {
             continue;
           }
 
+          // สินค้าปิดขาย/ถูกถอด — ลบออกจากรายการ ไม่เก็บเป็นพร้อมขายค้าง
+          const st = String(product.status || "").toLowerCase();
+          if (st && st !== "active" && st !== "normal" && st !== "activate") {
+            await productStore.deleteProduct(product.platform, product.productId);
+            continue;
+          }
+
           await productStore.upsertProduct(product);
+          keptIds.push(String(product.productId));
           nextProductCount += 1;
+        }
+
+        // รอบดึงแคตตาล็อกเต็ม: ลบสินค้าใน DB ที่ไม่มีในรายการที่ยังขาย
+        if (options.forceProducts) {
+          await productStore.deleteMissing(platform, keptIds);
         }
 
         await connectionStore.touchSync(fresh);

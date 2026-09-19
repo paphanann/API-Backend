@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 
-const inventoryStore = require("../services/inventoryStore");
+const inventoryStore = require("../services/stores/inventoryStore");
 
 router.get("/", async (req, res) => {
   try {

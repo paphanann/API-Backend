@@ -1,8 +1,8 @@
 const crypto = require("crypto");
 const axios = require("axios");
 
-const connectionStore = require("./connectionStore");
-const tokenService = require("./tokenService");
+const connectionStore = require("../stores/connectionStore");
+const tokenService = require("../tokenService");
 const {
   expiryDate,
   toDate,
@@ -10,7 +10,7 @@ const {
   text,
   mapOrderStatus,
   mapProductStatus,
-} = require("../utils/normalize");
+} = require("../../utils/normalize");
 
 function getConfig() {
   return {
@@ -398,7 +398,7 @@ function normalizeProduct(product) {
   };
 }
 
-const { resolveSyncWindow } = require("../utils/syncWindow");
+const { resolveSyncWindow } = require("../../utils/syncWindow");
 
 async function fetchOrders(connection, options = {}) {
   const window = resolveSyncWindow(connection, {

@@ -1,9 +1,11 @@
-const connectionStore = require("./connectionStore");
+const connectionStore = require("../stores/connectionStore");
 const syncEngine = require("./syncEngine");
-const shopeeService = require("./shopeeService");
-const tiktokService = require("./tiktokService");
-const lazadaService = require("./lazadaService");
-const { poolPromise } = require("../config/database");
+const syncLogStore = require("../stores/syncLogStore");
+const shopeeService = require("../marketplaces/shopeeService");
+const tiktokService = require("../marketplaces/tiktokService");
+const lazadaService = require("../marketplaces/lazadaService");
+const { poolPromise } = require("../../config/database");
+const { isStickyConfigError } = require("../../utils/syncErrors");
 
 const services = {
   Shopee: shopeeService,
@@ -11,12 +13,14 @@ const services = {
   Lazada: lazadaService,
 };
 
-// ถี่เกินไปจะทำให้ Sync Log ดูซ้ำ — ค่าเริ่มต้น 15 นาที
 const DEFAULT_INTERVAL_MS = 15 * 60 * 1000;
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
+const DEFAULT_STICKY_BACKOFF_MS = 6 * 60 * 60 * 1000;
 
 let timer = null;
 let running = false;
+/** @type {Map<string, { until: number, reason: string }>} */
+const stickyBackoff = new Map();
 
 function intervalMs() {
   const raw = Number(process.env.ORDER_SYNC_INTERVAL_MS || DEFAULT_INTERVAL_MS);
@@ -28,7 +32,33 @@ function cooldownMs() {
   return Number.isFinite(raw) && raw >= 30_000 ? raw : DEFAULT_COOLDOWN_MS;
 }
 
-/** ล็อกด้วย LastSyncAt — ไม่พึ่ง SyncLog (รอบ noop ไม่เขียน log) */
+function stickyBackoffMs() {
+  const raw = Number(process.env.SYNC_STICKY_BACKOFF_MS || DEFAULT_STICKY_BACKOFF_MS);
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : DEFAULT_STICKY_BACKOFF_MS;
+}
+
+function clearStickyBackoff(platform) {
+  stickyBackoff.delete(platform);
+}
+
+function armStickyBackoff(platform, reason) {
+  const until = Date.now() + stickyBackoffMs();
+  stickyBackoff.set(platform, { until, reason: String(reason || "").slice(0, 200) });
+  console.warn(
+    `Auto-sync backoff ${platform} until ${new Date(until).toISOString()} (${Math.round(stickyBackoffMs() / 3600000)}h) — ${reason}`
+  );
+}
+
+function stickyBlocked(platform) {
+  const row = stickyBackoff.get(platform);
+  if (!row) return null;
+  if (Date.now() >= row.until) {
+    stickyBackoff.delete(platform);
+    return null;
+  }
+  return row;
+}
+
 async function recentlySyncedInDb(ms) {
   try {
     const pool = await poolPromise;
@@ -74,17 +104,36 @@ async function syncAllConnected(options = {}) {
     synced: 0,
     failed: 0,
     noop: 0,
+    deferred: 0,
     results: [],
     errors: [],
   };
 
   try {
-    const platforms = ["Shopee", "TikTok", "Lazada"];
-
-    for (const platform of platforms) {
+    for (const platform of ["Shopee", "TikTok", "Lazada"]) {
       const service = services[platform];
-      if (!service || !service.isConfigured || !service.isConfigured()) {
+      if (!service || typeof service.isConfigured !== "function" || !service.isConfigured()) {
         continue;
+      }
+
+      if (!options.force) {
+        const blocked = stickyBlocked(platform);
+        if (blocked) {
+          summary.deferred += 1;
+          summary.results.push({
+            platform,
+            success: false,
+            skipped: true,
+            deferred: true,
+            message: `ข้ามชั่วคราว (config error): ${blocked.reason}`,
+          });
+          console.log(
+            `Auto-sync deferred: ${platform} until ${new Date(blocked.until).toISOString()}`
+          );
+          continue;
+        }
+      } else {
+        clearStickyBackoff(platform);
       }
 
       let connection;
@@ -93,17 +142,11 @@ async function syncAllConnected(options = {}) {
       } catch (error) {
         summary.failed += 1;
         summary.errors.push(`${platform}: ${error.message}`);
-        summary.results.push({
-          platform,
-          success: false,
-          message: error.message,
-        });
+        summary.results.push({ platform, success: false, message: error.message });
         continue;
       }
 
-      if (!connection) {
-        continue;
-      }
+      if (!connection) continue;
 
       if (platform === "TikTok" && !connection.shopCipher) {
         summary.results.push({
@@ -121,11 +164,9 @@ async function syncAllConnected(options = {}) {
         const result = await syncEngine.syncPlatform(platform, {
           forceProducts: Boolean(options.forceProducts),
         });
-        if (result.noop) {
-          summary.noop += 1;
-        } else {
-          summary.synced += 1;
-        }
+        clearStickyBackoff(platform);
+        if (result.noop) summary.noop += 1;
+        else summary.synced += 1;
         summary.results.push(result);
         console.log(
           `Auto-sync ok: ${platform} orders=${result.orderCount} products=${result.productCount} noop=${Boolean(result.noop)}`
@@ -133,12 +174,12 @@ async function syncAllConnected(options = {}) {
       } catch (error) {
         summary.failed += 1;
         summary.errors.push(`${platform}: ${error.message}`);
-        summary.results.push({
-          platform,
-          success: false,
-          message: error.message,
-        });
+        summary.results.push({ platform, success: false, message: error.message });
         console.error(`Auto-sync failed: ${platform} -> ${error.message}`);
+
+        if (isStickyConfigError(error.message)) {
+          armStickyBackoff(platform, error.message);
+        }
       }
     }
   } finally {
@@ -149,9 +190,7 @@ async function syncAllConnected(options = {}) {
 }
 
 function startOrderSyncJob() {
-  if (timer) {
-    return;
-  }
+  if (timer) return;
 
   if (String(process.env.ORDER_SYNC_AUTO || "true").toLowerCase() === "false") {
     console.log("Order auto-sync job disabled (ORDER_SYNC_AUTO=false)");
@@ -160,14 +199,25 @@ function startOrderSyncJob() {
 
   const every = intervalMs();
   console.log(
-    `Order auto-sync job started (every ${Math.round(every / 60000)} min, cooldown ${Math.round(cooldownMs() / 60000)} min)`
+    `Order auto-sync job started (every ${Math.round(every / 60000)} min, cooldown ${Math.round(cooldownMs() / 60000)} min, sticky backoff ${Math.round(stickyBackoffMs() / 3600000)}h)`
   );
 
-  // รอบแรกหลังบูต 45 วินาที
   setTimeout(() => {
-    syncAllConnected().catch((error) => {
-      console.error("Order auto-sync startup run failed:", error.message);
-    });
+    syncLogStore
+      .collapseDuplicateErrors()
+      .then((deleted) => {
+        if (deleted > 0) {
+          console.log(`Collapsed ${deleted} duplicate SyncLog error row(s)`);
+        }
+      })
+      .catch((error) => {
+        console.warn("collapseDuplicateErrors failed:", error.message);
+      })
+      .finally(() => {
+        syncAllConnected().catch((error) => {
+          console.error("Order auto-sync startup run failed:", error.message);
+        });
+      });
   }, 45_000);
 
   timer = setInterval(() => {
@@ -176,9 +226,7 @@ function startOrderSyncJob() {
     });
   }, every);
 
-  if (typeof timer.unref === "function") {
-    timer.unref();
-  }
+  if (typeof timer.unref === "function") timer.unref();
 }
 
 function stopOrderSyncJob() {
@@ -192,4 +240,5 @@ module.exports = {
   startOrderSyncJob,
   stopOrderSyncJob,
   syncAllConnected,
+  clearStickyBackoff,
 };

@@ -1,6 +1,6 @@
-const { poolPromise, sql } = require("../config/database");
+const { poolPromise, sql } = require("../../config/database");
 const { ensureSchema } = require("./schema");
-const tokenService = require("./tokenService");
+const tokenService = require("../tokenService");
 
 function defaultUserId() {
   const raw = Number(process.env.DEFAULT_USER_ID || 1);

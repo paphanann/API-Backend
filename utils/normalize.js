@@ -88,20 +88,40 @@ function mapOrderStatus(raw) {
 }
 
 function mapProductStatus(raw) {
-  const value = String(raw || "").toLowerCase();
+  const value = String(raw || "")
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
 
-  if (value.includes("draft") || value.includes("pending")) {
+  if (
+    value.includes("draft") ||
+    value.includes("pending") ||
+    value.includes("review")
+  ) {
     return "draft";
   }
 
+  // TikTok: PLATFORM_DEACTIVATED / SELLER_DEACTIVATED / FREEZE / DELETED
+  // Shopee/Lazada: inactive, banned, deleted, unlist, etc.
   if (
     value.includes("inactive") ||
+    value.includes("deactivat") ||
     value.includes("disable") ||
     value.includes("banned") ||
+    value.includes("suspend") ||
+    value.includes("freeze") ||
     value.includes("delete") ||
-    value.includes("off")
+    value.includes("unlist") ||
+    value === "off" ||
+    value.includes("not_for_sale") ||
+    value.includes("platform_deactivated") ||
+    value.includes("seller_deactivated")
   ) {
     return "inactive";
+  }
+
+  // TikTok live listing
+  if (value === "activate" || value === "active" || value.includes("normal")) {
+    return "active";
   }
 
   return "active";

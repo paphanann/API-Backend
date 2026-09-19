@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const { normalizePlatform } = require("../utils/platform");
-const productStore = require("../services/productStore");
+const productStore = require("../services/stores/productStore");
 
 function absoluteHttps(url) {
   if (!url || typeof url !== "string") return null;

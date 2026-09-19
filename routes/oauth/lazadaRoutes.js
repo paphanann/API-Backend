@@ -1,20 +1,10 @@
 const express = require("express");
 
-const lazadaService = require("../services/lazadaService");
-const { publicError } = require("../utils/normalize");
+const lazadaService = require("../../services/marketplaces/lazadaService");
+const { publicError } = require("../../utils/normalize");
+const { frontendConnections } = require("../../utils/frontendConnections");
 
 const router = express.Router();
-
-function frontendConnections(status, message) {
-  const base = process.env.FRONTEND_URL || "http://localhost:5173";
-  const url = new URL("/connections", base);
-  url.searchParams.set("status", status);
-  url.searchParams.set(
-    "message",
-    message || (status === "success" ? "เชื่อมต่อสำเร็จ" : "")
-  );
-  return url.toString();
-}
 
 router.get("/connect", (req, res) => {
   const authUrl = lazadaService.buildAuthorizationUrl();

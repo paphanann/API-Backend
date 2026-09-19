@@ -1,8 +1,8 @@
 const crypto = require("crypto");
 const axios = require("axios");
 
-const connectionStore = require("./connectionStore");
-const tokenService = require("./tokenService");
+const connectionStore = require("../stores/connectionStore");
+const tokenService = require("../tokenService");
 const {
   expiryDate,
   toDate,
@@ -10,7 +10,7 @@ const {
   text,
   mapOrderStatus,
   mapProductStatus,
-} = require("../utils/normalize");
+} = require("../../utils/normalize");
 
 function getConfig() {
   const partnerId = Number(String(process.env.SHOPEE_PARTNER_ID || "").trim());
@@ -373,7 +373,7 @@ function normalizeProduct(item, modelsPayload = null) {
   };
 }
 
-const { resolveSyncWindow } = require("../utils/syncWindow");
+const { resolveSyncWindow } = require("../../utils/syncWindow");
 
 async function fetchOrders(connection, options = {}) {
   const window = resolveSyncWindow(connection, {
@@ -466,7 +466,7 @@ async function fetchProducts(connection, options = {}) {
 
     const itemList = (data.response && data.response.item) || [];
     const ids = itemList.map((item) => item.item_id).filter(Boolean);
-
+ 
     if (ids.length) {
       const detail = await shopeeRequest("GET", "/api/v2/product/get_item_base_info", {
         connection,

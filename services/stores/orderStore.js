@@ -1,4 +1,4 @@
-const { poolPromise } = require("../config/database");
+const { poolPromise } = require("../../config/database");
 const { ensureSchema } = require("./schema");
 
 function linesJson(order) {
@@ -105,8 +105,64 @@ async function setSapDoc(platform, marketplaceOrderId, sapDocNum, syncStatus) {
     `);
 }
 
+function parseLines(raw) {
+  if (!raw) {
+    return [];
+  }
+
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function listOrders(platform) {
+  await ensureSchema();
+  const pool = await poolPromise;
+  const request = pool.request();
+
+  let query = `
+    SELECT
+      Id,
+      Platform,
+      MarketplaceOrderId,
+      CustomerName,
+      CustomerPhone,
+      ShippingAddress,
+      OrderDate,
+      OrderStatus,
+      PaymentMethod,
+      ShippingMethod,
+      TotalAmount,
+      Currency,
+      SyncStatus,
+      SapDocNum,
+      ItemsJson
+    FROM dbo.MarketplaceOrder
+  `;
+
+  if (platform) {
+    request.input("platform", platform);
+    query += " WHERE Platform = @platform";
+  }
+
+  query += " ORDER BY OrderDate DESC";
+
+  const result = await request.query(query);
+  return result.recordset.map((order) => {
+    const { ItemsJson, ...rest } = order;
+    return {
+      ...rest,
+      lines: parseLines(ItemsJson),
+    };
+  });
+}
+
 module.exports = {
   upsertOrder,
   setSapDoc,
+  listOrders,
 };
 

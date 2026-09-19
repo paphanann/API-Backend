@@ -1,8 +1,9 @@
 const express = require("express");
 const crypto = require("crypto");
 
-const tiktokService = require("../services/tiktokService");
-const { publicError } = require("../utils/normalize");
+const tiktokService = require("../../services/marketplaces/tiktokService");
+const { publicError } = require("../../utils/normalize");
+const { frontendConnections } = require("../../utils/frontendConnections");
 
 const router = express.Router();
 
@@ -16,20 +17,6 @@ function cleanupPending() {
       pendingReturns.delete(key);
     }
   }
-}
-
-function frontendConnections(status, message, returnBase) {
-  const base =
-    returnBase ||
-    process.env.FRONTEND_URL ||
-    "http://localhost:5173";
-  const url = new URL(base.includes("/connections") ? base : `${base.replace(/\/$/, "")}/connections`);
-  url.searchParams.set("status", status);
-  url.searchParams.set(
-    "message",
-    message || (status === "success" ? "เชื่อมต่อสำเร็จ" : "")
-  );
-  return url.toString();
 }
 
 router.get("/connect", (req, res) => {
@@ -54,17 +41,15 @@ router.get("/connect", (req, res) => {
     );
   }
 
-  console.log("TikTok authorize URL:", authUrl);
-  console.log("TikTok return after callback:", returnUrl);
   res.redirect(authUrl);
 });
 
 router.get("/callback", async (req, res) => {
   cleanupPending();
 
-  const state = String(req.query.state || "");
-  const pending = pendingReturns.get(state);
-  if (pending) {
+  const state = String(req.query.state || "").trim();
+  const pending = state ? pendingReturns.get(state) : null;
+  if (state) {
     pendingReturns.delete(state);
   }
   const returnUrl =
@@ -72,33 +57,20 @@ router.get("/callback", async (req, res) => {
     `${process.env.FRONTEND_URL || "http://localhost:5173"}/connections`;
 
   try {
-    const code = req.query.code || req.query.auth_code;
-
+    const code = String(req.query.code || "").trim();
     if (!code) {
-      console.error("TikTok callback missing code:", req.query);
       return res.redirect(
         frontendConnections("error", "TikTok ไม่ได้ส่งรหัสอนุญาตกลับมา", returnUrl)
       );
     }
 
-    console.log("TikTok Authorization Code received (hidden length):", String(code).length);
-
-    const shop = await tiktokService.completeOAuth(req.query);
-    console.log(
-      `TikTok saved MarketplaceConnection shop=${shop.shopId || "-"} name=${shop.shopName || "-"}`
-    );
-
+    await tiktokService.completeOAuth(req.query);
     res.redirect(frontendConnections("success", "เชื่อมต่อ TikTok สำเร็จ", returnUrl));
   } catch (error) {
     console.error("TikTok connect failed:", error.message);
-    if (error.response && error.response.data) {
-      console.error("TikTok token error body:", error.response.data);
-    }
-    // token อาจบันทึกแล้วแต่ยังไม่มี shop_cipher — บอกให้ไปเปิด scope
-    const status = error.partialSuccess ? "error" : "error";
     res.redirect(
       frontendConnections(
-        status,
+        "error",
         publicError(error, "เชื่อมต่อ TikTok ไม่สำเร็จ"),
         returnUrl
       )

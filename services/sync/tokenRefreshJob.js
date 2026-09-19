@@ -1,8 +1,8 @@
-const connectionStore = require("./connectionStore");
-const tokenService = require("./tokenService");
-const shopeeService = require("./shopeeService");
-const tiktokService = require("./tiktokService");
-const lazadaService = require("./lazadaService");
+const connectionStore = require("../stores/connectionStore");
+const tokenService = require("../tokenService");
+const shopeeService = require("../marketplaces/shopeeService");
+const tiktokService = require("../marketplaces/tiktokService");
+const lazadaService = require("../marketplaces/lazadaService");
 
 const services = {
   Shopee: shopeeService,

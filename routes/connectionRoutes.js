@@ -3,27 +3,17 @@ const router = express.Router();
 
 const { normalizePlatform } = require("../utils/platform");
 const { publicError } = require("../utils/normalize");
-const { ensureSchema } = require("../services/schema");
-const connectionStore = require("../services/connectionStore");
-const shopeeService = require("../services/shopeeService");
-const tiktokService = require("../services/tiktokService");
-const lazadaService = require("../services/lazadaService");
+const { frontendConnections } = require("../utils/frontendConnections");
+const { ensureSchema } = require("../services/stores/schema");
+const connectionStore = require("../services/stores/connectionStore");
+const shopeeService = require("../services/marketplaces/shopeeService");
+const tiktokService = require("../services/marketplaces/tiktokService");
+const lazadaService = require("../services/marketplaces/lazadaService");
 
 const services = {
   shopee: shopeeService,
   tiktok: tiktokService,
 };
-
-function frontendConnections(status, message) {
-  const base = process.env.FRONTEND_URL || "http://localhost:5173";
-  const url = new URL("/connections", base);
-  url.searchParams.set("status", status);
-  url.searchParams.set(
-    "message",
-    message || (status === "success" ? "เชื่อมต่อสำเร็จ" : "")
-  );
-  return url.toString();
-}
 
 const missingKeyMessage = {
   shopee: "ยังไม่ได้ตั้ง SHOPEE_PARTNER_ID และ SHOPEE_PARTNER_KEY ในไฟล์ .env",
@@ -72,7 +62,6 @@ router.get("/", async (req, res) => {
   try {
     await ensureSchema();
 
-    // ถ้า Lazada ยังเก็บอีเมลเป็นชื่อร้าน ให้ดึงโปรไฟล์ผู้ขายมาอัปเดตอัตโนมัติ
     try {
       const lazada = await connectionStore.getConnected("Lazada");
       if (
@@ -125,7 +114,7 @@ router.get("/tiktok/callback", (req, res) => {
 
 router.post("/refresh-tokens", async (req, res) => {
   try {
-    const { refreshDueConnections } = require("../services/tokenRefreshJob");
+    const { refreshDueConnections } = require("../services/sync/tokenRefreshJob");
     const summary = await refreshDueConnections();
     res.json({
       success: true,

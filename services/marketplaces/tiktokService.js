@@ -1,8 +1,8 @@
 const crypto = require("crypto");
 const axios = require("axios");
 
-const connectionStore = require("./connectionStore");
-const tokenService = require("./tokenService");
+const connectionStore = require("../stores/connectionStore");
+const tokenService = require("../tokenService");
 const {
   expiryDate,
   toDate,
@@ -10,7 +10,7 @@ const {
   text,
   mapOrderStatus,
   mapProductStatus,
-} = require("../utils/normalize");
+} = require("../../utils/normalize");
 
 function getConfig() {
   return {
@@ -455,7 +455,7 @@ function normalizeProduct(product) {
   };
 }
 
-const { resolveSyncWindow } = require("../utils/syncWindow");
+const { resolveSyncWindow } = require("../../utils/syncWindow");
 
 async function fetchOrders(connection, options = {}) {
   const window = resolveSyncWindow(connection, {
@@ -529,7 +529,10 @@ async function fetchProducts(connection, options = {}) {
     }
 
     const body = {};
-    if (window.incremental && !options.forceProducts) {
+    // แคตตาล็อกเต็ม: ดึงเฉพาะ ACTIVATE | incremental: ตามเวลาอัปเดต (จะลบตัวปิดขายตอน sync)
+    if (!window.incremental || options.forceProducts) {
+      body.status = "ACTIVATE";
+    } else {
       body.update_time_ge = window.sinceSec;
       body.update_time_lt = window.untilSec;
     }
@@ -545,6 +548,13 @@ async function fetchProducts(connection, options = {}) {
     for (const row of list) {
       const id = row && row.id;
       if (!id) continue;
+
+      const rowStatus = String(row.status || "").toUpperCase();
+      if (rowStatus && rowStatus !== "ACTIVATE") {
+        // ส่งต่อไปให้ syncEngine ลบออกจาก DB
+        products.push(normalizeProduct(row));
+        continue;
+      }
 
       // search ไม่มี main_images — ต้องดึง detail ทีละชิ้น
       let product = row;

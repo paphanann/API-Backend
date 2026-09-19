@@ -1,6 +1,6 @@
 const { poolPromise, sql } = require("../config/database");
 const { encrypt, decrypt } = require("../utils/tokenCrypto");
-const { ensureSchema } = require("./schema");
+const { ensureSchema } = require("./stores/schema");
 
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
 

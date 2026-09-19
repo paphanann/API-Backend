@@ -1,4 +1,4 @@
-const { poolPromise } = require("../config/database");
+const { poolPromise } = require("../../config/database");
 const { ensureSchema } = require("./schema");
 
 function skuKey(row) {
