@@ -137,6 +137,24 @@ async function ensureSchema() {
 
       SET IDENTITY_INSERT dbo.MarketplaceConnection OFF;
     END
+
+    IF OBJECT_ID(N'dbo.AppSettings', N'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.AppSettings
+      (
+        Id INT NOT NULL CONSTRAINT PK_AppSettings PRIMARY KEY,
+        SettingsJson NVARCHAR(MAX) NOT NULL
+          CONSTRAINT DF_AppSettings_Json DEFAULT N'{}',
+        PasswordEncrypted NVARCHAR(MAX) NULL,
+        ErpLastChecked DATETIME2 NULL,
+        UpdatedAt DATETIME2 NOT NULL
+          CONSTRAINT DF_AppSettings_UpdatedAt DEFAULT GETDATE(),
+        CONSTRAINT CK_AppSettings_Singleton CHECK (Id = 1)
+      );
+
+      INSERT INTO dbo.AppSettings (Id, SettingsJson)
+      VALUES (1, N'{}');
+    END
   `);
 
   ensured = true;

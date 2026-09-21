@@ -12,6 +12,8 @@ const productRoutes = require("./routes/productRoutes");
 const inventoryRoutes = require("./routes/inventoryRoutes");
 const syncRoutes = require("./routes/syncRoutes");
 const authRoutes = require("./routes/authRoutes");
+const settingsRoutes = require("./routes/settingsRoutes");
+const usersRoutes = require("./routes/usersRoutes");
 const tiktokRoutes = require("./routes/oauth/tiktokRoutes");
 const lazadaRoutes = require("./routes/oauth/lazadaRoutes");
 const shopeeService = require("./services/marketplaces/shopeeService");
@@ -82,6 +84,8 @@ app.get("/api/health", (req, res) => {
 });
 
 app.use("/api/auth", authRoutes);
+app.use("/api/settings", settingsRoutes);
+app.use("/api/users", usersRoutes);
 app.use("/api/connections", connectionRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/products", productRoutes);
