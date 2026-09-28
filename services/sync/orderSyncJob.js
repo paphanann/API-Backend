@@ -190,7 +190,10 @@ async function syncAllConnected(options = {}) {
 }
 
 function startOrderSyncJob() {
-  if (timer) return;
+  if (timer) {
+    console.log("Order auto-sync job already running — skip second start");
+    return;
+  }
 
   if (String(process.env.ORDER_SYNC_AUTO || "true").toLowerCase() === "false") {
     console.log("Order auto-sync job disabled (ORDER_SYNC_AUTO=false)");
@@ -203,8 +206,17 @@ function startOrderSyncJob() {
   );
 
   setTimeout(() => {
-    syncLogStore
-      .collapseDuplicateErrors()
+    Promise.resolve()
+      .then(() => syncLogStore.collapseDuplicateRuns())
+      .then((deleted) => {
+        if (deleted > 0) {
+          console.log(`Collapsed ${deleted} duplicate SyncLog success row(s)`);
+        }
+      })
+      .catch((error) => {
+        console.warn("collapseDuplicateRuns failed:", error.message);
+      })
+      .then(() => syncLogStore.collapseDuplicateErrors())
       .then((deleted) => {
         if (deleted > 0) {
           console.log(`Collapsed ${deleted} duplicate SyncLog error row(s)`);

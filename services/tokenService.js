@@ -1,6 +1,7 @@
 const { poolPromise, sql } = require("../config/database");
 const { encrypt, decrypt } = require("../utils/tokenCrypto");
 const { ensureSchema } = require("./stores/schema");
+const { isPlausibleTokenExpiry } = require("../utils/normalize");
 
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
 
@@ -93,13 +94,19 @@ function needsReconnect(connection) {
   return new Date(connection.refreshTokenExpireAt).getTime() <= Date.now();
 }
 
+function keepExpiry(next, prev) {
+  if (next && isPlausibleTokenExpiry(next)) return next;
+  if (prev && isPlausibleTokenExpiry(prev)) return prev;
+  return null;
+}
+
 async function applyRefresh(connection, payload) {
   const next = {
     ...connection,
     accessToken: payload.accessToken || connection.accessToken,
     refreshToken: payload.refreshToken || connection.refreshToken,
-    accessTokenExpireAt: payload.accessTokenExpireAt || connection.accessTokenExpireAt,
-    refreshTokenExpireAt: payload.refreshTokenExpireAt || connection.refreshTokenExpireAt,
+    accessTokenExpireAt: keepExpiry(payload.accessTokenExpireAt, connection.accessTokenExpireAt),
+    refreshTokenExpireAt: keepExpiry(payload.refreshTokenExpireAt, connection.refreshTokenExpireAt),
     shopCipher: payload.shopCipher || connection.shopCipher,
   };
 
@@ -111,6 +118,7 @@ async function applyRefresh(connection, payload) {
     accessTokenExpireAt: next.accessTokenExpireAt,
     refreshTokenExpireAt: next.refreshTokenExpireAt,
     shopCipher: next.shopCipher,
+    markRefreshed: true,
   });
 
   return next;
@@ -170,6 +178,7 @@ async function saveTokens({
   accessTokenExpireAt,
   refreshTokenExpireAt,
   shopCipher,
+  markRefreshed = false,
 }) {
   if (!accessToken) {
     throw new Error("ไม่มี Access Token ให้บันทึกลงฐานข้อมูล");
@@ -191,6 +200,7 @@ async function saveTokens({
     .input("accessExpire", sql.DateTime2, accessTokenExpireAt || null)
     .input("refreshExpire", sql.DateTime2, refreshTokenExpireAt || null)
     .input("shopCipher", sql.NVarChar(500), shopCipher || null)
+    .input("markRefreshed", sql.Bit, markRefreshed ? 1 : 0)
     .query(`
       DECLARE @id INT =
       (
@@ -211,10 +221,10 @@ async function saveTokens({
         AccessToken = @accessToken,
         RefreshToken = COALESCE(@refreshToken, RefreshToken),
         AccessTokenExpiresAt = @accessExpire,
-        RefreshTokenExpiresAt = COALESCE(@refreshExpire, RefreshTokenExpiresAt),
+        RefreshTokenExpiresAt = @refreshExpire,
         ShopCipher = COALESCE(@shopCipher, ShopCipher),
         ConnectionStatus = N'CONNECTED',
-        LastRefreshAt = GETDATE(),
+        LastRefreshAt = CASE WHEN @markRefreshed = 1 THEN GETDATE() ELSE LastRefreshAt END,
         UpdatedAt = GETDATE()
       WHERE ConnectionId = @id;
 

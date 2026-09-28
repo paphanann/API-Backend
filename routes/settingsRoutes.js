@@ -98,6 +98,73 @@ router.post("/test-erp", async (req, res) => {
   }
 });
 
+router.get("/erp-options", async (req, res) => {
+  try {
+    const empty = { cardCodes: [], warehouses: [], branches: [], taxCodes: [] };
+    const creds = await settingsStore.getErpCredentials();
+    if (!creds.baseUrl || !creds.companyDb || !creds.username || !creds.password) {
+      return res.json(empty);
+    }
+
+    const insecure = String(process.env.SAP_TLS_INSECURE || "").toLowerCase() === "true";
+    const http = axios.create({
+      baseURL: `${creds.baseUrl}/b1s/v1`,
+      timeout: 20000,
+      httpsAgent: insecure ? new https.Agent({ rejectUnauthorized: false }) : undefined,
+      headers: { "Content-Type": "application/json" },
+      validateStatus: () => true,
+    });
+
+    const login = await http.post("/Login", {
+      CompanyDB: creds.companyDb,
+      UserName: creds.username,
+      Password: creds.password,
+    });
+    if (!(login.status >= 200 && login.status < 300 && login.data && login.data.SessionId)) {
+      return res.json(empty);
+    }
+
+    const headers = { Cookie: `B1SESSION=${login.data.SessionId}` };
+
+    async function codes(path, fields) {
+      const response = await http.get(path, { headers });
+      const rows = response.data && Array.isArray(response.data.value) ? response.data.value : [];
+      const out = [];
+      for (const row of rows) {
+        for (const field of fields) {
+          if (row[field] != null && String(row[field]).trim()) {
+            out.push(String(row[field]).trim());
+            break;
+          }
+        }
+      }
+      return [...new Set(out)];
+    }
+
+    const cardCodes = await codes(
+      "/BusinessPartners?$select=CardCode&$filter=CardType eq 'C'&$top=200",
+      ["CardCode"]
+    );
+    const warehouses = await codes("/Warehouses?$select=WarehouseCode&$top=200", ["WarehouseCode"]);
+    const branches = await codes("/BusinessPlaces?$select=BPLName,BPLID&$top=200", ["BPLName", "BPLID"]);
+    let taxCodes = await codes("/SalesTaxCodes?$select=Code&$top=200", ["Code"]);
+    if (!taxCodes.length) {
+      taxCodes = await codes("/VatGroups?$select=Code&$top=200", ["Code"]);
+    }
+
+    try {
+      await http.post("/Logout", {}, { headers });
+    } catch {
+      /* ignore */
+    }
+
+    res.json({ cardCodes, warehouses, branches, taxCodes });
+  } catch (error) {
+    console.error(error);
+    res.json({ cardCodes: [], warehouses: [], branches: [], taxCodes: [] });
+  }
+});
+
 router.get("/users", async (req, res) => {
   try {
     const users = await settingsStore.listUsers();

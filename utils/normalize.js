@@ -24,7 +24,20 @@ function toDate(value) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function expiryDate(value) {
+const MAX_TOKEN_TTL_MS = 400 * 24 * 60 * 60 * 1000;
+const EARLIEST_TOKEN_MS = Date.UTC(2024, 0, 1);
+const UNIX_SECONDS_MIN = 1577836800;
+
+function isPlausibleTokenExpiry(value, now = Date.now()) {
+  const date = value instanceof Date ? value : new Date(value);
+  const time = date.getTime();
+  if (Number.isNaN(time)) return false;
+  if (time < EARLIEST_TOKEN_MS) return false;
+  if (time > now + MAX_TOKEN_TTL_MS) return false;
+  return true;
+}
+
+function expiryDate(value, now = Date.now()) {
   if (value === undefined || value === null || value === "") {
     return null;
   }
@@ -34,11 +47,36 @@ function expiryDate(value) {
     return null;
   }
 
-  if (numeric > 1577836800) {
-    return new Date(numeric * 1000);
+  let date;
+  if (numeric >= 1e12) {
+    date = new Date(numeric);
+  } else if (numeric > UNIX_SECONDS_MIN) {
+    const asUnix = new Date(numeric * 1000);
+    // บาง API ส่ง TTL เป็นมิลลิวินาที (~5e9 = ประมาณ 60 วัน)
+    // ซึ่งใหญ่กว่า threshold ของ unix seconds เลยกลายเป็นปี 2127
+    date = isPlausibleTokenExpiry(asUnix, now) ? asUnix : new Date(now + numeric);
+  } else {
+    date = new Date(now + numeric * 1000);
   }
 
-  return new Date(Date.now() + numeric * 1000);
+  return isPlausibleTokenExpiry(date, now) ? date : null;
+}
+
+function repairStoredExpiry(stored, anchor, now = Date.now()) {
+  if (stored == null || stored === "") return null;
+
+  const storedDate = stored instanceof Date ? stored : new Date(stored);
+  if (Number.isNaN(storedDate.getTime())) return null;
+  if (isPlausibleTokenExpiry(storedDate, now)) return storedDate;
+
+  const numeric = storedDate.getTime() / 1000;
+  const anchorMs = anchor == null || anchor === "" ? now : new Date(anchor).getTime();
+  if (numeric > UNIX_SECONDS_MIN && numeric < 1e11 && Number.isFinite(anchorMs)) {
+    const repaired = new Date(anchorMs + numeric);
+    if (isPlausibleTokenExpiry(repaired, now)) return repaired;
+  }
+
+  return null;
 }
 
 function money(value) {
@@ -140,6 +178,8 @@ function publicError(error, fallback) {
 module.exports = {
   toDate,
   expiryDate,
+  isPlausibleTokenExpiry,
+  repairStoredExpiry,
   money,
   text,
   mapOrderStatus,

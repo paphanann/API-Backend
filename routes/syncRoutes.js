@@ -8,10 +8,24 @@ const syncEngine = require("../services/sync/syncEngine");
 const { syncAllConnected } = require("../services/sync/orderSyncJob");
 
 function cleanLogMessage(value) {
-  return String(value || "")
+  let text = String(value || "")
     .replace(/^\[ซ้ำ\s*x\d+\]\s*/i, "")
     .replace(/\s*—\s*แก้ที่ Shopee IP Whitelist.*$/i, "")
+    .replace(/^(Incremental|Full) Sync:\s*/i, "")
     .trim();
+
+  const lower = text.toLowerCase();
+  if (
+    lower.includes("whitelist") ||
+    lower.includes("undeclared") ||
+    (lower.includes("ip") && lower.includes("request source"))
+  ) {
+    return "IP ไม่อยู่ใน Whitelist";
+  }
+  if (lower.includes("frequency exceeds") || lower.includes("rate limit")) {
+    return "เรียก API บ่อยเกินไป (Rate limit)";
+  }
+  return text;
 }
 
 /** SQL DATETIME ไม่มี TZ — driver มักใส่ค่านาฬิกาไทยลง UTC แล้ว JSON ติด Z ทำให้หน้าเว็บ +7 */
@@ -32,32 +46,44 @@ function sqlDateTimePayload(value) {
 router.get("/logs", async (req, res) => {
   try {
     const pool = await poolPromise;
-    const syncLogStore = require("../services/stores/syncLogStore");
-    await syncLogStore.backfillFromOrders();
 
     const result = await pool.request().query(`
       SELECT TOP 200
-        Id,
-        ConnectionId,
-        Platform,
-        SyncType AS Action,
-        StartTime AS Time,
-        EndTime,
-        Status,
-        Message,
-        ErrorMessage,
-        OrderCount,
-        ProductCount,
-        MarketplaceOrderId,
-        MarketplaceOrderId AS OrderNo,
-        SapDocNum,
-        SapDocEntry
-      FROM SyncLog
-      WHERE MarketplaceOrderId IS NOT NULL
-         OR Status = N'error'
-         OR ISNULL(ProductCount, 0) > 0
-         OR ISNULL(OrderCount, 0) > 0
-      ORDER BY StartTime DESC, Id DESC
+        s.Id,
+        s.ConnectionId,
+        s.Platform,
+        s.SyncType AS Action,
+        s.StartTime AS Time,
+        s.EndTime,
+        s.Status,
+        s.Message,
+        s.ErrorMessage,
+        s.OrderCount,
+        s.ProductCount,
+        s.MarketplaceOrderId,
+        s.MarketplaceOrderId AS OrderNo,
+        s.SapDocNum,
+        s.SapDocEntry,
+        s.SyncRunId,
+        s.ParentSyncRunId
+      FROM dbo.SyncLog AS s
+      WHERE (
+          s.MarketplaceOrderId IS NOT NULL
+          AND LOWER(s.Status) IN (N'error', N'failed')
+        )
+        OR (
+          s.MarketplaceOrderId IS NULL
+          AND s.ParentSyncRunId IS NULL
+          AND LOWER(s.Status) IN (N'error', N'failed', N'partial')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM dbo.SyncLog AS d
+            WHERE d.ParentSyncRunId = s.SyncRunId
+              AND d.MarketplaceOrderId IS NOT NULL
+              AND LOWER(d.Status) IN (N'error', N'failed')
+          )
+        )
+      ORDER BY s.StartTime DESC, s.Id DESC
     `);
 
     res.json(

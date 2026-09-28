@@ -18,28 +18,76 @@ const services = {
 
 async function pushToSap(order) {
   if (!sapService.isConfigured()) {
-    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, null, "saved");
+    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, null, "saved", order.shopId);
     return { status: "skipped" };
   }
 
   try {
     const docNum = await sapService.createSalesOrder(order);
-    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, docNum, "sap_ok");
+    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, docNum, "sap_ok", order.shopId);
     return { status: "ok", docNum };
   } catch (error) {
-    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, null, "sap_error");
+    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, null, "sap_error", order.shopId);
     return { status: "error", message: publicError(error, "SAP error") };
   }
 }
 
-function sapMessage(sap) {
+function sapDetailMessage(sap, change) {
+  const verb =
+    change === "inserted" ? "เพิ่มออเดอร์ใหม่" : change === "updated" ? "อัปเดตออเดอร์" : "ออเดอร์";
   if (sap.status === "ok") {
-    return `ซิงก์ออเดอร์แล้ว (SAP DocNum ${sap.docNum})`;
+    return `${verb} แล้ว (SAP DocNum ${sap.docNum})`;
   }
   if (sap.status === "error") {
-    return `ซิงก์ออเดอร์แล้ว แต่ SAP ไม่สำเร็จ: ${sap.message || "error"}`;
+    return `${verb} แล้ว แต่ SAP ไม่สำเร็จ: ${sap.message || "error"}`;
   }
-  return "ซิงก์ออเดอร์แล้ว (ยังไม่ได้ตั้งค่า SAP)";
+  return `${verb} แล้ว (ยังไม่ได้ตั้งค่า SAP)`;
+}
+
+function buildRunMessage({
+  found,
+  inserted,
+  updated,
+  unchanged,
+  sapOk,
+  sapError,
+  productCount,
+}) {
+  if (found === 0 && productCount === 0) {
+    return "ไม่พบการเปลี่ยนแปลง";
+  }
+
+  const parts = [];
+  if (inserted > 0) parts.push(`เพิ่มออเดอร์ใหม่ ${inserted} รายการ`);
+  if (updated > 0) parts.push(`อัปเดตออเดอร์ ${updated} รายการ`);
+  if (unchanged > 0 && inserted === 0 && updated === 0) {
+    parts.push("ไม่พบการเปลี่ยนแปลง");
+  } else if (unchanged > 0) {
+    parts.push(`ไม่เปลี่ยนแปลง ${unchanged} รายการ`);
+  }
+  if (productCount > 0) {
+    parts.push(`อัปเดตสินค้า ${productCount} รายการ`);
+  }
+  if (sapService.isConfigured() && (sapOk > 0 || sapError > 0)) {
+    if (sapError > 0 && sapOk > 0) {
+      parts.push(`สำเร็จ ${sapOk} รายการ / ล้มเหลว ${sapError} รายการ`);
+    } else if (sapError > 0) {
+      parts.push(`SAP ล้มเหลว ${sapError} รายการ`);
+    }
+  }
+
+  return parts.join(" · ") || "ซิงก์สำเร็จ";
+}
+
+function resolveRunStatus({ sapError, inserted, updated, productCount, sapOk }) {
+  const changed = inserted + updated;
+  if (sapError > 0 && (changed > 0 || productCount > 0 || sapOk > 0)) {
+    return "partial";
+  }
+  if (sapError > 0 && changed === 0 && productCount === 0) {
+    return "error";
+  }
+  return "success";
 }
 
 async function syncPlatform(platform, options = {}) {
@@ -56,11 +104,24 @@ async function syncPlatform(platform, options = {}) {
   }
 
   const window = resolveSyncWindow(connection, options.window);
-  const start = Date.now();
+  const startedAt = Date.now();
+  const syncType = window.incremental ? "incremental" : "full";
+
+  // 1 รอบ = 1 แถวหลัก: INSERT ตอนเริ่ม แล้ว UPDATE ตอนจบ (กัน log ซ้ำ)
+  const { syncRunId } = await syncLogStore.beginRun({
+    connectionId: connection.id,
+    platform,
+    syncType,
+    message: "กำลังซิงก์…",
+  });
+
   let orderCount = 0;
   let productCount = 0;
   let sapOk = 0;
   let sapError = 0;
+  let inserted = 0;
+  let updated = 0;
+  let unchanged = 0;
 
   try {
     const ran = await tokenService.runWithFreshTokens(
@@ -71,6 +132,9 @@ async function syncPlatform(platform, options = {}) {
         let nextProductCount = 0;
         let nextSapOk = 0;
         let nextSapError = 0;
+        let nextInserted = 0;
+        let nextUpdated = 0;
+        let nextUnchanged = 0;
 
         const orders = await service.fetchOrders(fresh, { window: options.window });
 
@@ -79,28 +143,35 @@ async function syncPlatform(platform, options = {}) {
             continue;
           }
 
-          await orderStore.upsertOrder(order);
+          order.shopId = connection.shopId ? String(connection.shopId) : null;
+          const result = await orderStore.upsertOrder(order);
           nextOrderCount += 1;
+
+          if (result.change === "inserted") {
+            nextInserted += 1;
+          } else if (result.change === "updated") {
+            nextUpdated += 1;
+          } else {
+            nextUnchanged += 1;
+            continue;
+          }
 
           const sap = await pushToSap(order);
           if (sap.status === "ok") {
             nextSapOk += 1;
           } else if (sap.status === "error") {
             nextSapError += 1;
+            await syncLogStore.writeDetail({
+              connectionId: connection.id,
+              platform,
+              parentSyncRunId: syncRunId,
+              status: "error",
+              message: sapDetailMessage(sap, result.change),
+              errorMessage: sap.message || null,
+              marketplaceOrderId: order.marketplaceOrderId,
+              sapDocNum: sap.docNum || null,
+            });
           }
-
-          await syncLogStore.writeLog({
-            connectionId: connection.id,
-            platform,
-            syncType: "order",
-            status: sap.status === "error" ? "error" : "success",
-            message: sapMessage(sap),
-            orderCount: 1,
-            productCount: 0,
-            marketplaceOrderId: order.marketplaceOrderId,
-            sapDocNum: sap.docNum || null,
-            errorMessage: sap.status === "error" ? sap.message : null,
-          });
         }
 
         const products = await service.fetchProducts(fresh, {
@@ -113,7 +184,6 @@ async function syncPlatform(platform, options = {}) {
             continue;
           }
 
-          // สินค้าปิดขาย/ถูกถอด — ลบออกจากรายการ ไม่เก็บเป็นพร้อมขายค้าง
           const st = String(product.status || "").toLowerCase();
           if (st && st !== "active" && st !== "normal" && st !== "activate") {
             await productStore.deleteProduct(product.platform, product.productId);
@@ -125,25 +195,20 @@ async function syncPlatform(platform, options = {}) {
           nextProductCount += 1;
         }
 
-        // รอบดึงแคตตาล็อกเต็ม: ลบสินค้าใน DB ที่ไม่มีในรายการที่ยังขาย
         if (options.forceProducts) {
           await productStore.deleteMissing(platform, keptIds);
         }
 
         await connectionStore.touchSync(fresh);
 
-        const mode = window.incremental ? "เฉพาะที่เปลี่ยน" : "รอบแรก";
-        const message = sapService.isConfigured()
-          ? `${mode}: ออเดอร์ ${nextOrderCount} สินค้า ${nextProductCount} (SAP สำเร็จ ${nextSapOk} ล้มเหลว ${nextSapError})`
-          : `${mode}: ออเดอร์ ${nextOrderCount} สินค้า ${nextProductCount}`;
-
         return {
-          message,
           orderCount: nextOrderCount,
           productCount: nextProductCount,
           sapOk: nextSapOk,
           sapError: nextSapError,
-          incremental: window.incremental,
+          inserted: nextInserted,
+          updated: nextUpdated,
+          unchanged: nextUnchanged,
         };
       }
     );
@@ -152,45 +217,68 @@ async function syncPlatform(platform, options = {}) {
     productCount = ran.result.productCount;
     sapOk = ran.result.sapOk;
     sapError = ran.result.sapError;
-    const message = ran.result.message;
-    const noop =
-      window.incremental &&
-      orderCount === 0 &&
-      productCount === 0 &&
-      sapError === 0;
+    inserted = ran.result.inserted;
+    updated = ran.result.updated;
+    unchanged = ran.result.unchanged;
 
-    // มีออเดอร์แล้วเขียนทีละเลขด้านบน — เขียนสรุปเฉพาะตอนมีแต่สินค้า หรือรอบเต็มที่ไม่มีออเดอร์
-    if (!noop && orderCount === 0 && productCount > 0) {
-      await syncLogStore.writeLog({
-        connectionId: connection.id,
-        platform,
-        syncType: window.incremental ? "incremental" : "full",
-        status: "success",
-        message,
-        orderCount: 0,
-        productCount,
-      });
-    }
+    const pureNoop =
+      window.incremental && orderCount === 0 && productCount === 0 && sapError === 0;
+
+    const allUnchanged =
+      orderCount > 0 && inserted === 0 && updated === 0 && sapError === 0;
+
+    const message = buildRunMessage({
+      found: orderCount,
+      inserted,
+      updated,
+      unchanged,
+      sapOk,
+      sapError,
+      productCount,
+    });
+
+    // สำเร็จรวมถึง “ไม่พบการเปลี่ยนแปลง” — ไม่ใช้ skipped เป็นสถานะหลัก
+    const status = resolveRunStatus({
+      sapError,
+      inserted,
+      updated,
+      productCount,
+      sapOk,
+    });
+
+    await syncLogStore.finishRun(syncRunId, {
+      status,
+      message,
+      errorMessage: status === "error" || status === "partial"
+        ? sapError > 0
+          ? `SAP ล้มเหลว ${sapError}`
+          : null
+        : null,
+      orderCount,
+      productCount,
+    });
 
     return {
-      success: true,
+      success: status !== "error",
       platform,
+      syncRunId,
       incremental: window.incremental,
-      noop,
-      durationMs: Date.now() - start,
+      noop: pureNoop || allUnchanged,
+      durationMs: Date.now() - startedAt,
       orderCount,
       productCount,
       sapOk,
       sapError,
-      message: noop ? "ไม่มีการเปลี่ยนแปลง" : message,
+      inserted,
+      updated,
+      unchanged,
+      status,
+      message,
     };
   } catch (error) {
     const message = publicError(error, "ซิงก์ไม่สำเร็จ");
 
-    await syncLogStore.writeLog({
-      connectionId: connection.id,
-      platform,
-      syncType: window.incremental ? "incremental" : "full",
+    await syncLogStore.finishRun(syncRunId, {
       status: "error",
       message,
       errorMessage: message,

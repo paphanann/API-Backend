@@ -1,4 +1,5 @@
-const { poolPromise } = require("../../config/database");
+const { poolPromise, sql } = require("../../config/database");
+const { repairStoredExpiry } = require("../../utils/normalize");
 
 let ensured = false;
 
@@ -29,6 +30,18 @@ async function ensureSchema() {
         ALTER TABLE dbo.SyncLog ADD SapDocNum NVARCHAR(50) NULL;
       IF COL_LENGTH('dbo.SyncLog', 'SapDocEntry') IS NULL
         ALTER TABLE dbo.SyncLog ADD SapDocEntry NVARCHAR(50) NULL;
+      IF COL_LENGTH('dbo.SyncLog', 'SyncRunId') IS NULL
+        ALTER TABLE dbo.SyncLog ADD SyncRunId NVARCHAR(36) NULL;
+      IF COL_LENGTH('dbo.SyncLog', 'ParentSyncRunId') IS NULL
+        ALTER TABLE dbo.SyncLog ADD ParentSyncRunId NVARCHAR(36) NULL;
+    END
+
+    IF OBJECT_ID(N'dbo.MarketplaceOrder', N'U') IS NOT NULL
+    BEGIN
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'LastSyncedAt') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD LastSyncedAt DATETIME2 NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'ShopId') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD ShopId NVARCHAR(100) NULL;
     END
 
     IF OBJECT_ID(N'dbo.MarketplaceConnection', N'U') IS NULL
@@ -157,7 +170,97 @@ async function ensureSchema() {
     END
   `);
 
+  // แยก batch — CREATE INDEX บนคอลัมน์ที่เพิ่ง ADD ใน batch เดียวกันจะพัง
+  await pool.request().query(`
+    IF OBJECT_ID(N'dbo.SyncLog', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.SyncLog', 'SyncRunId') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'UX_SyncLog_SyncRunId'
+           AND object_id = OBJECT_ID(N'dbo.SyncLog')
+       )
+    BEGIN
+      CREATE UNIQUE INDEX UX_SyncLog_SyncRunId
+        ON dbo.SyncLog (SyncRunId)
+        WHERE SyncRunId IS NOT NULL
+          AND MarketplaceOrderId IS NULL
+          AND ParentSyncRunId IS NULL;
+    END
+  `);
+
+  await pool.request().query(`
+    UPDATE o
+    SET o.ShopId = c.ShopId
+    FROM dbo.MarketplaceOrder o
+    INNER JOIN dbo.MarketplaceConnection c
+      ON c.Platform = o.Platform
+     AND UPPER(c.ConnectionStatus) = N'CONNECTED'
+     AND c.ShopId IS NOT NULL
+    WHERE o.ShopId IS NULL
+  `);
+
+  await repairConnectionExpiries(pool);
+
   ensured = true;
+}
+
+function sameInstant(next, prev) {
+  if (next == null && (prev == null || prev === "")) return true;
+  if (next == null || prev == null) return false;
+  const left = next instanceof Date ? next.getTime() : new Date(next).getTime();
+  const right = prev instanceof Date ? prev.getTime() : new Date(prev).getTime();
+  return left === right;
+}
+
+async function repairConnectionExpiries(pool) {
+  await pool.request().query(`
+    UPDATE dbo.MarketplaceConnection
+    SET LastRefreshAt = NULL
+    WHERE LastRefreshAt IS NOT NULL
+      AND AuthorizedAt IS NOT NULL
+      AND ABS(DATEDIFF(SECOND, AuthorizedAt, LastRefreshAt)) <= 2
+  `);
+
+  const result = await pool.request().query(`
+    SELECT
+      ConnectionId,
+      Platform,
+      AccessTokenExpiresAt,
+      RefreshTokenExpiresAt,
+      AuthorizedAt,
+      LastRefreshAt
+    FROM dbo.MarketplaceConnection
+  `);
+
+  for (const row of result.recordset) {
+    const anchor = row.LastRefreshAt || row.AuthorizedAt;
+    const access = repairStoredExpiry(row.AccessTokenExpiresAt, anchor);
+    const refresh = repairStoredExpiry(row.RefreshTokenExpiresAt, anchor);
+    if (
+      sameInstant(access, row.AccessTokenExpiresAt) &&
+      sameInstant(refresh, row.RefreshTokenExpiresAt)
+    ) {
+      continue;
+    }
+
+    await pool
+      .request()
+      .input("id", sql.Int, row.ConnectionId)
+      .input("accessExpire", sql.DateTime2, access)
+      .input("refreshExpire", sql.DateTime2, refresh)
+      .query(`
+        UPDATE dbo.MarketplaceConnection
+        SET
+          AccessTokenExpiresAt = @accessExpire,
+          RefreshTokenExpiresAt = @refreshExpire
+        WHERE ConnectionId = @id
+      `);
+
+    console.log(
+      `Repaired token expiry: ${row.Platform}` +
+        ` refresh=${refresh ? refresh.toISOString() : "null"}`
+    );
+  }
 }
 
 module.exports = {
