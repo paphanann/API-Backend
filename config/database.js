@@ -6,10 +6,10 @@ const config = {
   server: process.env.DB_SERVER,
   database: process.env.DB_DATABASE,
 
-  options: {
-    encrypt: false,
-    trustServerCertificate: true,
-  },
+options: {
+  encrypt: true,
+  trustServerCertificate: false,
+},
 
   pool: {
     max: 10,
