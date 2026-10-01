@@ -22,8 +22,10 @@ const lazadaService = require("./services/marketplaces/lazadaService");
 const { ensureSchema } = require("./services/stores/schema");
 const { startTokenRefreshJob } = require("./services/sync/tokenRefreshJob");
 const { startOrderSyncJob } = require("./services/sync/orderSyncJob");
+const { startSapMapJob } = require("./services/marketplaces/sapService");
 
 const app = express();
+app.set("trust proxy", 1);
 
 const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
   .split(",")
@@ -117,4 +119,5 @@ app.listen(PORT, "0.0.0.0", () => {
   );
   startTokenRefreshJob();
   startOrderSyncJob();
+  startSapMapJob();
 });

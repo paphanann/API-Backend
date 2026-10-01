@@ -32,6 +32,13 @@ async function pushToSap(order) {
   }
 }
 
+function shouldCreateSalesOrder(order, result) {
+  if (result && result.sapDocNum) {
+    return false;
+  }
+  return String(order.orderStatus || "").toLowerCase() !== "cancelled";
+}
+
 function sapDetailMessage(sap, change) {
   const verb =
     change === "inserted" ? "เพิ่มออเดอร์ใหม่" : change === "updated" ? "อัปเดตออเดอร์" : "ออเดอร์";
@@ -153,8 +160,23 @@ async function syncPlatform(platform, options = {}) {
             nextUpdated += 1;
           } else {
             nextUnchanged += 1;
+          }
+
+          // ใบ SO ออกตอนมีออเดอร์ ไม่รอส่งของหรือเก็บเงิน
+          if (!shouldCreateSalesOrder(order, result)) {
             continue;
           }
+
+          order.lines = await Promise.all(
+            (order.lines || []).map(async (line) => {
+              const codes = await productStore.sapCodesForSku(order.platform, line.sku);
+              return {
+                ...line,
+                sapItemCode: codes.length === 1 ? codes[0] : null,
+                sapAmbiguous: codes.length > 1,
+              };
+            })
+          );
 
           const sap = await pushToSap(order);
           if (sap.status === "ok") {
@@ -197,6 +219,14 @@ async function syncPlatform(platform, options = {}) {
 
         if (options.forceProducts) {
           await productStore.deleteMissing(platform, keptIds);
+        }
+
+        if (sapService.isConfigured()) {
+          try {
+            await sapService.mapStoredProducts(platform);
+          } catch (error) {
+            console.error(`SAP item map failed for ${platform}:`, error.message);
+          }
         }
 
         await connectionStore.touchSync(fresh);

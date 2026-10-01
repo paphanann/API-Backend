@@ -17,7 +17,7 @@ async function ensureSchema() {
     IF OBJECT_ID(N'dbo.MarketplaceProduct', N'U') IS NOT NULL
     BEGIN
       IF COL_LENGTH('dbo.MarketplaceProduct', 'ImageUrl') IS NULL
-        ALTER TABLE dbo.MarketplaceProduct ADD ImageUrl NVARCHAR(1000) NULL;
+        ALTER TABLE dbo.MarketplaceProduct ADD ImageUrl NVARCHAR(MAX) NULL;
       IF COL_LENGTH('dbo.MarketplaceProduct', 'VariantsJson') IS NULL
         ALTER TABLE dbo.MarketplaceProduct ADD VariantsJson NVARCHAR(MAX) NULL;
     END
@@ -171,6 +171,18 @@ async function ensureSchema() {
   `);
 
   // แยก batch — CREATE INDEX บนคอลัมน์ที่เพิ่ง ADD ใน batch เดียวกันจะพัง
+  await pool.request().query(`
+    IF OBJECT_ID(N'dbo.MarketplaceProduct', N'U') IS NOT NULL
+       AND EXISTS (
+         SELECT 1
+         FROM sys.columns
+         WHERE object_id = OBJECT_ID(N'dbo.MarketplaceProduct')
+           AND name = N'ImageUrl'
+           AND max_length <> -1
+       )
+      ALTER TABLE dbo.MarketplaceProduct ALTER COLUMN ImageUrl NVARCHAR(MAX) NULL;
+  `);
+
   await pool.request().query(`
     IF OBJECT_ID(N'dbo.SyncLog', N'U') IS NOT NULL
        AND COL_LENGTH('dbo.SyncLog', 'SyncRunId') IS NOT NULL

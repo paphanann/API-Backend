@@ -9,7 +9,7 @@ const config = {
 
 options: {
   encrypt: true,
-  trustServerCertificate: false,
+  trustServerCertificate: true,
 },
 
   connectionTimeout: 30000,

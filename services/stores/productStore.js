@@ -201,10 +201,41 @@ async function listProducts(platform) {
   });
 }
 
+async function saveVariantMap(platform, productId, variants) {
+  await ensureSchema();
+  const pool = await poolPromise;
+  await pool
+    .request()
+    .input("platform", platform)
+    .input("productId", String(productId))
+    .input("variantsJson", JSON.stringify(variants || []))
+    .query(`
+      UPDATE dbo.MarketplaceProduct
+      SET VariantsJson = @variantsJson
+      WHERE Platform = @platform
+        AND ProductId = @productId
+    `);
+}
+
+async function sapCodesForSku(platform, sku) {
+  const rows = await listProducts(platform);
+  const wanted = String(sku || "").trim();
+  const codes = new Set();
+  for (const row of rows) {
+    for (const variant of row.variants || []) {
+      if (String(variant.sku || "").trim() !== wanted || !variant.sapItemCode) continue;
+      codes.add(String(variant.sapItemCode));
+    }
+  }
+  return [...codes];
+}
+
 module.exports = {
   upsertProduct,
   deleteProduct,
   deleteNonActive,
   deleteMissing,
   listProducts,
+  saveVariantMap,
+  sapCodesForSku,
 };

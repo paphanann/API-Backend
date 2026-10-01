@@ -299,7 +299,7 @@ function pickShopeeImage(item) {
 
   const ids = (item.image && item.image.image_id_list) || item.image_id_list || [];
   const id = Array.isArray(ids) ? ids[0] : null;
-  if (id) return `https://cf.shopee.co.th/file/${id}`;
+  if (id) return `https://down-th.img.susercontent.com/file/${id}`;
   return null;
 }
 

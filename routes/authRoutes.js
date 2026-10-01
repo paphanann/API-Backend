@@ -63,8 +63,23 @@ async function tableExists(pool, tableName) {
   return result.recordset.length > 0;
 }
 
+async function hasColumn(pool, tableName, columnName) {
+  const result = await pool
+    .request()
+    .input("tableName", sql.NVarChar, tableName)
+    .input("columnName", sql.NVarChar, columnName)
+    .query(`
+      SELECT COL_LENGTH('dbo.' + @tableName, @columnName) AS ColLen
+    `);
+  const len = result.recordset[0] && result.recordset[0].ColLen;
+  return len !== null && len !== undefined;
+}
+
 async function findLoginUser(pool, login) {
   if (await tableExists(pool, "Users")) {
+    const roleSql = (await hasColumn(pool, "Users", "Role"))
+      ? "COALESCE(Role, N'User') AS Role,"
+      : "N'User' AS Role,";
     const result = await pool
       .request()
       .input("login", sql.NVarChar, login)
@@ -73,7 +88,9 @@ async function findLoginUser(pool, login) {
           Username,
           Password,
           FullName,
-          IsActive
+          IsActive,
+          ${roleSql}
+          1 AS Ok
         FROM dbo.Users
         WHERE Username = @login
       `);
@@ -84,6 +101,9 @@ async function findLoginUser(pool, login) {
   }
 
   if (await tableExists(pool, "AppUser")) {
+    const roleSql = (await hasColumn(pool, "AppUser", "Role"))
+      ? "COALESCE(Role, N'User') AS Role,"
+      : "N'User' AS Role,";
     const result = await pool
       .request()
       .input("login", sql.NVarChar, login)
@@ -92,7 +112,9 @@ async function findLoginUser(pool, login) {
           Email,
           Username,
           Name,
-          PasswordHash
+          PasswordHash,
+          ${roleSql}
+          1 AS Ok
         FROM dbo.AppUser
         WHERE Email = @login
            OR Username = @login
@@ -130,6 +152,7 @@ router.post("/login", async (req, res) => {
       user: {
         email: pick(row, ["Email", "Username"]) || login,
         name: pick(row, ["FullName", "Name"]) || login,
+        role: pick(row, ["Role"]) || "User",
       },
     });
   } catch (error) {
