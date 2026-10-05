@@ -1,4 +1,5 @@
 const { poolPromise } = require("../../config/database");
+const { splitOrderAmounts, mapShippingStatus, mapOrderStatus } = require("../../utils/normalize");
 const { ensureSchema } = require("./schema");
 
 function linesJson(order) {
@@ -9,6 +10,25 @@ function linesJson(order) {
 function normText(value) {
   if (value == null) return "";
   return String(value).trim();
+}
+
+function bangkokStamp(value) {
+  if (value == null || value === "") return value;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Bangkok",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const pick = (type) => parts.find((part) => part.type === type).value;
+  return `${pick("year")}-${pick("month")}-${pick("day")}T${pick("hour")}:${pick("minute")}:${pick("second")}`;
 }
 
 function normAmount(value) {
@@ -33,7 +53,11 @@ function orderFingerprint(row) {
     orderStatus: normText(row.OrderStatus || row.orderStatus).toLowerCase(),
     paymentMethod: normText(row.PaymentMethod || row.paymentMethod),
     shippingMethod: normText(row.ShippingMethod || row.shippingMethod),
+    platformStatus: normText(row.PlatformStatus || row.platformStatus),
     totalAmount: normAmount(row.TotalAmount != null ? row.TotalAmount : row.totalAmount),
+    itemAmount: normAmount(row.ItemAmount != null ? row.ItemAmount : row.itemAmount),
+    discountAmount: normAmount(row.DiscountAmount != null ? row.DiscountAmount : row.discountAmount),
+    shippingAmount: normAmount(row.ShippingAmount != null ? row.ShippingAmount : row.shippingAmount),
     currency: normText(row.Currency || row.currency).toUpperCase(),
     itemsJson: normText(row.ItemsJson || row.itemsJson || linesJson({ lines: row.lines })),
   });
@@ -58,7 +82,8 @@ async function upsertOrder(order) {
     .query(`
       SELECT TOP 1
         CustomerName, CustomerPhone, ShippingAddress, OrderDate, OrderStatus,
-        PaymentMethod, ShippingMethod, TotalAmount, Currency, ItemsJson, SyncStatus, SapDocNum
+        PaymentMethod, ShippingMethod, PlatformStatus, TotalAmount, ItemAmount, DiscountAmount, ShippingAmount,
+        Currency, ItemsJson, SyncStatus, SapDocNum
       FROM dbo.MarketplaceOrder
       WHERE Platform = @platform
         AND MarketplaceOrderId = @orderId
@@ -73,7 +98,11 @@ async function upsertOrder(order) {
     orderStatus: order.orderStatus,
     paymentMethod: order.paymentMethod,
     shippingMethod: order.shippingMethod,
+    platformStatus: order.platformStatus,
     totalAmount: order.totalAmount,
+    itemAmount: order.itemAmount,
+    discountAmount: order.discountAmount,
+    shippingAmount: order.shippingAmount,
     currency: order.currency,
     itemsJson: items,
   });
@@ -90,7 +119,11 @@ async function upsertOrder(order) {
       .input("orderStatus", order.orderStatus || null)
       .input("paymentMethod", order.paymentMethod || null)
       .input("shippingMethod", order.shippingMethod || null)
+      .input("platformStatus", order.platformStatus || null)
       .input("totalAmount", order.totalAmount)
+      .input("itemAmount", order.itemAmount)
+      .input("discountAmount", order.discountAmount)
+      .input("shippingAmount", order.shippingAmount)
       .input("currency", order.currency || null)
       .input("syncStatus", order.syncStatus || "saved")
       .input("itemsJson", items)
@@ -99,13 +132,15 @@ async function upsertOrder(order) {
         INSERT INTO dbo.MarketplaceOrder
         (
           Platform, MarketplaceOrderId, ShopId, CustomerName, CustomerPhone, ShippingAddress,
-          OrderDate, OrderStatus, PaymentMethod, ShippingMethod, TotalAmount,
+          OrderDate, OrderStatus, PaymentMethod, ShippingMethod, PlatformStatus, TotalAmount,
+          ItemAmount, DiscountAmount, ShippingAmount,
           Currency, SyncStatus, ItemsJson, LastSyncedAt
         )
         VALUES
         (
           @platform, @orderId, @shopId, @customerName, @customerPhone, @shippingAddress,
-          @orderDate, @orderStatus, @paymentMethod, @shippingMethod, @totalAmount,
+          @orderDate, @orderStatus, @paymentMethod, @shippingMethod, @platformStatus, @totalAmount,
+          @itemAmount, @discountAmount, @shippingAmount,
           @currency, @syncStatus, @itemsJson, GETDATE()
         )
       `);
@@ -147,7 +182,11 @@ async function upsertOrder(order) {
     .input("orderStatus", order.orderStatus || null)
     .input("paymentMethod", order.paymentMethod || null)
     .input("shippingMethod", order.shippingMethod || null)
+    .input("platformStatus", order.platformStatus || null)
     .input("totalAmount", order.totalAmount)
+    .input("itemAmount", order.itemAmount)
+    .input("discountAmount", order.discountAmount)
+    .input("shippingAmount", order.shippingAmount)
     .input("currency", order.currency || null)
     .input("syncStatus", order.syncStatus || prev.SyncStatus || "saved")
     .input("itemsJson", items)
@@ -162,7 +201,11 @@ async function upsertOrder(order) {
         OrderStatus = @orderStatus,
         PaymentMethod = @paymentMethod,
         ShippingMethod = @shippingMethod,
+        PlatformStatus = @platformStatus,
         TotalAmount = @totalAmount,
+        ItemAmount = @itemAmount,
+        DiscountAmount = @discountAmount,
+        ShippingAmount = @shippingAmount,
         Currency = @currency,
         SyncStatus = @syncStatus,
         ItemsJson = @itemsJson,
@@ -199,6 +242,23 @@ async function setSapDoc(platform, marketplaceOrderId, sapDocNum, syncStatus, sh
     `);
 }
 
+function presentAmounts(order, lines) {
+  if (order.ItemAmount == null && order.DiscountAmount == null && order.ShippingAmount == null) {
+    const priced = splitOrderAmounts(lines, order.TotalAmount, 0);
+    return {
+      itemAmount: priced.itemAmount,
+      discountAmount: priced.discountAmount,
+      shippingAmount: 0,
+    };
+  }
+
+  return {
+    itemAmount: normAmount(order.ItemAmount),
+    discountAmount: normAmount(order.DiscountAmount),
+    shippingAmount: normAmount(order.ShippingAmount),
+  };
+}
+
 function parseLines(raw) {
   if (!raw) {
     return [];
@@ -230,7 +290,11 @@ async function listOrders(platform) {
       o.OrderStatus,
       o.PaymentMethod,
       o.ShippingMethod,
+      o.PlatformStatus,
       o.TotalAmount,
+      o.ItemAmount,
+      o.DiscountAmount,
+      o.ShippingAmount,
       o.Currency,
       o.SyncStatus,
       o.SapDocNum,
@@ -253,9 +317,30 @@ async function listOrders(platform) {
   const result = await request.query(query);
   return result.recordset.map((order) => {
     const { ItemsJson, ...rest } = order;
+    const lines = parseLines(ItemsJson);
+    const amounts = presentAmounts(order, lines);
+    const shippingStatus = mapShippingStatus(order.PlatformStatus);
+    const shippingCarrier = normText(order.ShippingMethod) || "ยังไม่ระบุ";
+    const orderStatus = order.PlatformStatus
+      ? mapOrderStatus(order.PlatformStatus)
+      : order.OrderStatus;
     return {
       ...rest,
-      lines: parseLines(ItemsJson),
+      OrderDate: bangkokStamp(order.OrderDate),
+      LastSyncedAt: bangkokStamp(order.LastSyncedAt),
+      OrderStatus: orderStatus,
+      orderStatus,
+      lines,
+      shippingStatus,
+      ShippingStatus: shippingStatus,
+      shippingCarrier,
+      ShippingCarrier: shippingCarrier,
+      ItemAmount: amounts.itemAmount,
+      DiscountAmount: amounts.discountAmount,
+      ShippingAmount: amounts.shippingAmount,
+      itemAmount: amounts.itemAmount,
+      discountAmount: amounts.discountAmount,
+      shippingAmount: amounts.shippingAmount,
     };
   });
 }

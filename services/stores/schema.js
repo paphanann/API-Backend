@@ -42,6 +42,14 @@ async function ensureSchema() {
         ALTER TABLE dbo.MarketplaceOrder ADD LastSyncedAt DATETIME2 NULL;
       IF COL_LENGTH('dbo.MarketplaceOrder', 'ShopId') IS NULL
         ALTER TABLE dbo.MarketplaceOrder ADD ShopId NVARCHAR(100) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'ItemAmount') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD ItemAmount DECIMAL(18, 2) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'DiscountAmount') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD DiscountAmount DECIMAL(18, 2) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'ShippingAmount') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD ShippingAmount DECIMAL(18, 2) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'PlatformStatus') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD PlatformStatus NVARCHAR(80) NULL;
     END
 
     IF OBJECT_ID(N'dbo.MarketplaceConnection', N'U') IS NULL

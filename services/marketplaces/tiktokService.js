@@ -7,7 +7,9 @@ const {
   expiryDate,
   toDate,
   money,
+  splitOrderAmounts,
   text,
+  visibleText,
   mapOrderStatus,
   mapProductStatus,
 } = require("../../utils/normalize");
@@ -352,36 +354,70 @@ async function ensureFreshTokens(connection, options = {}) {
 
 function recipientAddress(order) {
   const recipient = order.recipient_address || {};
-  return [recipient.full_address, recipient.district, recipient.city, recipient.region]
-    .filter(Boolean)
+  const districts = Array.isArray(recipient.district_info)
+    ? recipient.district_info.map((part) => part && part.address_name)
+    : [];
+  return [
+    recipient.full_address,
+    recipient.address_detail,
+    recipient.address_line1,
+    recipient.address_line2,
+    recipient.address_line3,
+    recipient.address_line4,
+    recipient.district,
+    recipient.city,
+    recipient.region,
+    recipient.postal_code,
+    ...districts,
+  ]
+    .map((part) => visibleText(part))
+    .filter((part, index, all) => part && all.indexOf(part) === index)
     .join(" ");
 }
 
 function normalizeOrder(order) {
   const payment = order.payment || {};
   const items = Array.isArray(order.line_items) ? order.line_items : [];
+  const lines = items.map((item) => ({
+    sku: text(item.seller_sku || item.sku_id || item.product_id, "-"),
+    name: text(item.product_name || item.sku_name, "-"),
+    qty: Number(item.quantity || 1),
+    price: money(item.sale_price || item.original_price),
+  }));
+  const totalAmount = money(payment.total_amount || order.payment_amount);
+  const shippingKnown = payment.shipping_fee != null && payment.shipping_fee !== "";
+  const originalShipping =
+    payment.original_shipping_fee != null && payment.original_shipping_fee !== ""
+      ? money(payment.original_shipping_fee)
+      : null;
+  const amounts = splitOrderAmounts(
+    lines,
+    totalAmount,
+    shippingKnown ? money(payment.shipping_fee) : originalShipping
+  );
 
   return {
     platform: "TikTok",
     marketplaceOrderId: text(order.id || order.order_id),
-    customerName: text(
-      (order.recipient_address && order.recipient_address.name) || order.buyer_nickname,
-      "-"
+    customerName:
+      visibleText(order.recipient_address && order.recipient_address.name) ||
+      visibleText(order.buyer_nickname, "-"),
+    customerPhone: visibleText(
+      order.recipient_address &&
+        (order.recipient_address.phone_number || order.recipient_address.phone)
     ),
-    customerPhone: text(order.recipient_address && order.recipient_address.phone_number),
     shippingAddress: recipientAddress(order),
     orderDate: toDate(order.create_time),
     orderStatus: mapOrderStatus(order.status),
+    platformStatus: text(order.status),
     paymentMethod: text(payment.payment_method),
     shippingMethod: text(order.delivery_option_name || order.shipping_provider),
-    totalAmount: money(payment.total_amount || order.payment_amount),
+    totalAmount,
+    itemAmount: amounts.itemAmount,
+    discountAmount: amounts.discountAmount,
+    shippingAmount: amounts.shippingAmount,
     currency: text(payment.currency, "THB"),
-    lines: items.map((item) => ({
-      sku: text(item.seller_sku || item.sku_id || item.product_id, "-"),
-      name: text(item.product_name || item.sku_name, "-"),
-      qty: Number(item.quantity || 1),
-      price: money(item.sale_price || item.original_price),
-    })),
+    lines,
   };
 }
 
@@ -457,6 +493,38 @@ function normalizeProduct(product) {
 
 const { resolveSyncWindow } = require("../../utils/syncWindow");
 
+async function fillTiktokRecipients(connection, orders) {
+  const missing = orders.filter((order) => {
+    const normalized = normalizeOrder(order);
+    return !normalized.customerPhone || !normalized.shippingAddress;
+  });
+  if (!missing.length) return orders;
+
+  const byId = new Map(orders.map((order) => [String(order.id || order.order_id), order]));
+  for (let i = 0; i < missing.length; i += 50) {
+    const ids = missing
+      .slice(i, i + 50)
+      .map((order) => order.id || order.order_id)
+      .filter(Boolean);
+    if (!ids.length) continue;
+    try {
+      const data = await tiktokRequest("GET", "/order/202309/orders", {
+        accessToken: connection.accessToken,
+        shopCipher: connection.shopCipher,
+        query: { ids: ids.join(",") },
+      });
+      const detailed = (data && data.orders) || [];
+      for (const order of detailed) {
+        byId.set(String(order.id || order.order_id), order);
+      }
+    } catch (error) {
+      console.warn("TikTok recipient:", error.message);
+    }
+  }
+
+  return orders.map((order) => byId.get(String(order.id || order.order_id)) || order);
+}
+
 async function fetchOrders(connection, options = {}) {
   const window = resolveSyncWindow(connection, {
     maxMs: 7 * 24 * 60 * 60 * 1000,
@@ -491,7 +559,8 @@ async function fetchOrders(connection, options = {}) {
     });
 
     const list = (data && data.orders) || [];
-    for (const order of list) {
+    const detailed = await fillTiktokRecipients(connection, list);
+    for (const order of detailed) {
       orders.push(normalizeOrder(order));
     }
 

@@ -191,7 +191,20 @@ function matchKey(value) {
     .trim();
 }
 
+function isInventoryItem(item) {
+  return String(item.InventoryItem || "").toUpperCase() === "TYES";
+}
+
+function isPlatformPlaceholder(item) {
+  const foreign = String(item.ForeignName || "").toLowerCase();
+  return PLATFORM_FOREIGN.has(foreign) && !isInventoryItem(item);
+}
+
 let masterCache = { at: 0, items: null };
+
+function clearMasterCache() {
+  masterCache = { at: 0, items: null };
+}
 
 async function listMasterItems() {
   if (masterCache.items && Date.now() - masterCache.at < 10 * 60 * 1000) {
@@ -208,9 +221,9 @@ async function listMasterItems() {
     const { data } = await http.get(path, {
       headers: { ...sessionHeaders(), Prefer: "odata.maxpagesize=100" },
     });
+    // เก็บทุกชิ้น — placeholder Shopee/Lazada ยังใช้จับคู่รหัส SKU ได้
+    // แต่ตอนเลือกผลลัพธ์จะ prefer สินค้า inventory (tYES) ก่อน
     for (const row of (data && data.value) || []) {
-      const foreign = String(row.ForeignName || "").toLowerCase();
-      if (PLATFORM_FOREIGN.has(foreign) && row.InventoryItem === "tNO") continue;
       items.push(row);
     }
     const next = data && (data["odata.nextLink"] || data["@odata.nextLink"]);
@@ -224,25 +237,72 @@ async function listMasterItems() {
 
 function buildMasterIndex(items) {
   const byApi = new Map();
-  const byCode = new Set();
+  const byCode = new Map();
   const byName = new Map();
 
   for (const item of items) {
     const code = String(item.ItemCode || "").trim();
     if (!code) continue;
-    byCode.add(code);
+    const meta = {
+      code,
+      inventory: isInventoryItem(item),
+      placeholder: isPlatformPlaceholder(item),
+      nameKey: matchKey(item.ItemName),
+    };
+    byCode.set(code, meta);
+
     const apiCode = String(item.U_Itemcode_api || "").trim();
     if (apiCode) {
       if (!byApi.has(apiCode)) byApi.set(apiCode, []);
-      byApi.get(apiCode).push(code);
+      byApi.get(apiCode).push(meta);
     }
-    const key = matchKey(item.ItemName);
-    if (!key) continue;
-    if (!byName.has(key)) byName.set(key, []);
-    byName.get(key).push(code);
+
+    if (!meta.nameKey) continue;
+    if (!byName.has(meta.nameKey)) byName.set(meta.nameKey, []);
+    byName.get(meta.nameKey).push(meta);
   }
 
   return { byApi, byCode, byName };
+}
+
+function pickBestMeta(list) {
+  if (!list || !list.length) return null;
+  const inventory = list.filter((m) => m.inventory);
+  const pool = inventory.length ? inventory : list;
+  return pool.slice().sort((a, b) => String(a.code).localeCompare(String(b.code)))[0];
+}
+
+function resolveByName(index, label, { inventoryOnly = false } = {}) {
+  const key = matchKey(label);
+  if (!key || key.length < 4) return null;
+
+  const exactList = index.byName.get(key) || [];
+  const exact = pickBestMeta(inventoryOnly ? exactList.filter((m) => m.inventory) : exactList);
+  if (exact) return exact.code;
+
+  // SAP ItemName มักถูกตัดสั้นกว่าชื่อใน marketplace — อนุญาต prefix match
+  let best = null;
+  let bestScore = 0;
+  for (const [nameKey, metas] of index.byName.entries()) {
+    if (nameKey.length < 12) continue;
+    const matched =
+      key === nameKey ||
+      (key.startsWith(nameKey) && nameKey.length >= 20) ||
+      (nameKey.startsWith(key) && key.length >= 20);
+    if (!matched) continue;
+    const pool = inventoryOnly ? metas.filter((m) => m.inventory) : metas;
+    const candidate = pickBestMeta(pool);
+    if (!candidate) continue;
+    const score = Math.min(key.length, nameKey.length);
+    if (
+      score > bestScore ||
+      (score === bestScore && candidate.inventory && !(best && best.inventory))
+    ) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+  return best ? best.code : null;
 }
 
 //แผนที่
@@ -255,31 +315,73 @@ function describeSapMatch(sapItemCode) {
   };
 }
 
-function resolveSapItemCode(index, { sku, label }) {
+function resolveSapItemCode(index, { sku, label, name }) {
   const code = String(sku || "").trim();
-  if (code && index.byApi.has(code) && index.byApi.get(code).length === 1) {
-    return index.byApi.get(code)[0];
+
+  const inventoryByLabel = () => {
+    for (const value of [label, name]) {
+      if (!value) continue;
+      const found = resolveByName(index, value, { inventoryOnly: true });
+      if (found) return found;
+    }
+    return null;
+  };
+
+  // 1) U_Itemcode_api / Itemcode_Web → รับเฉพาะ inventory จริง
+  if (code && index.byApi.has(code)) {
+    const hit = pickBestMeta(
+      (index.byApi.get(code) || []).filter((m) => m.inventory && !m.placeholder)
+    );
+    if (hit) return hit.code;
   }
-  if (code && index.byCode.has(code)) return code;
-  const hits = index.byName.get(matchKey(label)) || [];
-  if (!hits.length) return null;
-  return hits.slice().sort()[0];
+
+  // 2) ItemCode ตรง SKU → รับเฉพาะ inventory จริง
+  //    (ห้ามใช้รหัส placeholder ของ Shopee/TikTok/Lazada ที่ระบบสร้างค้างไว้)
+  if (code && index.byCode.has(code)) {
+    const meta = index.byCode.get(code);
+    if (meta.inventory && !meta.placeholder) return meta.code;
+  }
+
+  // 3) ชื่อตัวเลือก / ชื่อสินค้า → inventory เท่านั้น
+  const byName = inventoryByLabel();
+  if (byName) return byName;
+
+  // ไม่พบสินค้า inventory ใน SAP = Not Mapped
+  return null;
 }
 
 async function mapProduct(product) {
   const index = buildMasterIndex(await listMasterItems());
   const variants = (product.variants || []).map((variant) => {
     const option = String(variant.option || "").trim();
-    const label = option && option.toLowerCase() !== "active" ? option : product.name;
+    const optionLabel =
+      option && !["active", "inactive", "-", "null"].includes(option.toLowerCase())
+        ? option
+        : "";
+    // ถ้า option เป็นแค่ SKU/รหัสร้าน อย่าเอาไปเทียบชื่อ — ใช้ชื่อสินค้าหลักแทน
+    const optionIsCodeLike =
+      !optionLabel ||
+      matchKey(optionLabel) === matchKey(variant.sku) ||
+      matchKey(optionLabel) === matchKey(product.sku);
     return {
       ...variant,
-      ...describeSapMatch(resolveSapItemCode(index, { sku: variant.sku, label })),
+      ...describeSapMatch(
+        resolveSapItemCode(index, {
+          sku: variant.sku,
+          label: optionIsCodeLike ? null : optionLabel,
+          name: product.name,
+        })
+      ),
     };
   });
 
   let sapItemCode = null;
   if (!variants.length) {
-    sapItemCode = resolveSapItemCode(index, { sku: product.sku, label: product.name });
+    sapItemCode = resolveSapItemCode(index, {
+      sku: product.sku,
+      label: product.name,
+      name: product.name,
+    });
   } else {
     const codes = [...new Set(variants.map((variant) => variant.sapItemCode).filter(Boolean))];
     if (codes.length === 1 && variants.every((variant) => variant.sapItemCode)) {
@@ -306,6 +408,7 @@ async function mapProduct(product) {
 }
 
 async function mapStoredProducts(platform) {
+  clearMasterCache();
   const productStore = require("../stores/productStore");
   const rows = await productStore.listProducts(platform);
   let mapped = 0;
@@ -431,5 +534,6 @@ module.exports = {
   mapProduct,
   mapStoredProducts,
   startSapMapJob,
+  clearMasterCache,
   createSalesOrder,
 };

@@ -7,7 +7,9 @@ const {
   expiryDate,
   toDate,
   money,
+  splitOrderAmounts,
   text,
+  visibleText,
   mapOrderStatus,
   mapProductStatus,
 } = require("../../utils/normalize");
@@ -318,27 +320,55 @@ async function ensureFreshTokens(connection, options = {}) {
 function normalizeOrder(order) {
   const address = order.address_shipping || {};
   const items = Array.isArray(order.items) ? order.items : [];
+  const lines = items.map((item) => ({
+    sku: text(item.sku || item.shop_sku, "-"),
+    name: text(item.name, "-"),
+    qty: Number(item.quantity || 1),
+    price: money(item.item_price),
+  }));
+  const totalAmount = money(order.price);
+  const shippingKnown = order.shipping_fee != null && order.shipping_fee !== "";
+  const shippingOriginal =
+    order.shipping_fee_original != null && order.shipping_fee_original !== ""
+      ? money(order.shipping_fee_original)
+      : null;
+  const amounts = splitOrderAmounts(
+    lines,
+    totalAmount,
+    shippingKnown ? money(order.shipping_fee) : shippingOriginal
+  );
 
   return {
     platform: "Lazada",
     marketplaceOrderId: text(order.order_id || order.order_number),
-    customerName: text(address.first_name || order.customer_first_name, "-"),
-    customerPhone: text(address.phone),
-    shippingAddress: [address.address1, address.address2, address.city, address.address5]
+    customerName:
+      [address.first_name, address.last_name].map((part) => visibleText(part)).filter(Boolean).join(" ") ||
+      [order.customer_first_name, order.customer_last_name].map((part) => visibleText(part)).filter(Boolean).join(" ") ||
+      "-",
+    customerPhone: visibleText(address.phone || address.phone2),
+    shippingAddress: [
+      address.address1,
+      address.address2,
+      address.address3,
+      address.address4,
+      address.address5,
+      address.city,
+      address.post_code,
+    ]
+      .map((part) => visibleText(part))
       .filter(Boolean)
       .join(" "),
     orderDate: toDate(order.created_at),
     orderStatus: mapOrderStatus(order.statuses && order.statuses[0]),
+    platformStatus: text(order.statuses && order.statuses[0]),
     paymentMethod: text(order.payment_method),
     shippingMethod: text(order.shipping_provider_type),
-    totalAmount: money(order.price),
+    totalAmount,
+    itemAmount: amounts.itemAmount,
+    discountAmount: amounts.discountAmount,
+    shippingAmount: amounts.shippingAmount,
     currency: text(order.currency, "THB"),
-    lines: items.map((item) => ({
-      sku: text(item.sku || item.shop_sku, "-"),
-      name: text(item.name, "-"),
-      qty: Number(item.quantity || 1),
-      price: money(item.item_price),
-    })),
+    lines,
   };
 }
 
@@ -424,6 +454,23 @@ async function fetchOrders(connection, options = {}) {
   const orders = [];
 
   for (const row of list) {
+    try {
+      const full = await lazadaCall(
+        "/order/get",
+        { order_id: String(row.order_id) },
+        connection.accessToken
+      );
+      const order = (full.data && (full.data.order || full.data)) || {};
+      if (order.address_shipping) row.address_shipping = order.address_shipping;
+      if (order.customer_first_name) row.customer_first_name = order.customer_first_name;
+      if (order.customer_last_name) row.customer_last_name = order.customer_last_name;
+      for (const key of ["shipping_fee", "shipping_fee_original", "price"]) {
+        if (order[key] != null && order[key] !== "") row[key] = order[key];
+      }
+    } catch (error) {
+      console.warn(`Lazada order ${row.order_id}:`, error.message);
+    }
+
     try {
       const detail = await lazadaCall(
         "/order/items/get",

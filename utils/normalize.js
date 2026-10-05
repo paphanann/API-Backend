@@ -88,6 +88,42 @@ function money(value) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function roundMoney(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.round(numeric * 100) / 100;
+}
+
+function splitOrderAmounts(lines, totalAmount, shippingAmount) {
+  const itemAmount = roundMoney(
+    (Array.isArray(lines) ? lines : []).reduce((sum, line) => {
+      const price = Number(line && line.price);
+      const qty = Number(line && line.qty);
+      return sum + (Number.isFinite(price) ? price : 0) * (Number.isFinite(qty) ? qty : 0);
+    }, 0)
+  );
+  const total = roundMoney(totalAmount);
+  const shippingKnown = !(shippingAmount == null || shippingAmount === "");
+  let shipping = shippingKnown ? roundMoney(shippingAmount) : null;
+  let discount = 0;
+
+  if (!shippingKnown) {
+    if (total >= itemAmount) shipping = roundMoney(total - itemAmount);
+    else {
+      shipping = 0;
+      discount = roundMoney(itemAmount - total);
+    }
+  } else if (itemAmount + shipping > total) {
+    discount = roundMoney(itemAmount + shipping - total);
+  }
+
+  return {
+    itemAmount,
+    discountAmount: discount,
+    shippingAmount: shipping,
+  };
+}
+
 function text(value, fallback = null) {
   if (value === undefined || value === null) {
     return fallback;
@@ -95,6 +131,12 @@ function text(value, fallback = null) {
 
   const trimmed = String(value).trim();
   return trimmed ? trimmed : fallback;
+}
+
+function visibleText(value, fallback = null) {
+  const trimmed = text(value, null);
+  if (!trimmed || /^[\s*]+$/.test(trimmed)) return fallback;
+  return trimmed;
 }
 
 function mapOrderStatus(raw) {
@@ -108,21 +150,45 @@ function mapOrderStatus(raw) {
     return "cancelled";
   }
 
-  if (
-    value.includes("complete") ||
-    value.includes("deliver") ||
-    value.includes("shipped") ||
-    value.includes("success") ||
-    value.includes("paid") ||
-    value.includes("ready_to_ship") ||
-    value.includes("processed") ||
-    value.includes("awaiting_collection") ||
-    value.includes("in_transit")
-  ) {
+  if (value.includes("unpaid")) {
+    return "pending";
+  }
+
+  if (value.includes("complete") || value.includes("deliver")) {
     return "success";
   }
 
   return "pending";
+}
+
+function mapShippingStatus(raw) {
+  const value = String(raw || "")
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+
+  if (!value) return "ยังไม่ระบุ";
+  if (value.includes("cancel") || value.includes("void") || value.includes("in_cancel")) {
+    return "ยกเลิก";
+  }
+  if (value.includes("unpaid")) return "รอชำระเงิน";
+  if (
+    value.includes("ready_to_ship") ||
+    value.includes("processed") ||
+    value.includes("awaiting_shipment") ||
+    value.includes("awaiting_collection") ||
+    value.includes("retry_ship") ||
+    value.includes("packed")
+  ) {
+    return "รอจัดส่ง";
+  }
+  if (value.includes("shipped") || value.includes("in_transit") || value.includes("to_confirm")) {
+    return "กำลังจัดส่ง";
+  }
+  if (value.includes("deliver") || value.includes("complete") || value.includes("success")) {
+    return "จัดส่งแล้ว";
+  }
+  if (value.includes("return")) return "ตีกลับ";
+  return "ยังไม่ระบุ";
 }
 
 function mapProductStatus(raw) {
@@ -181,8 +247,12 @@ module.exports = {
   isPlausibleTokenExpiry,
   repairStoredExpiry,
   money,
+  roundMoney,
+  splitOrderAmounts,
   text,
+  visibleText,
   mapOrderStatus,
+  mapShippingStatus,
   mapProductStatus,
   publicError,
 };

@@ -7,7 +7,9 @@ const {
   expiryDate,
   toDate,
   money,
+  splitOrderAmounts,
   text,
+  visibleText,
   mapOrderStatus,
   mapProductStatus,
 } = require("../../utils/normalize");
@@ -248,31 +250,134 @@ async function ensureFreshTokens(connection, options = {}) {
   }
 }
 
+function shopeeShipping(detail) {
+  // buyer_paid_shipping_fee คือค่าส่งที่ผู้ซื้อจ่าย จาก get_escrow_detail
+  // actual/estimated บน get_order_detail เป็นค่าขนส่งฝั่งผู้ขาย และมักเป็น 0 ก่อนส่งของ
+  if (detail.buyer_paid_shipping_fee != null && detail.buyer_paid_shipping_fee !== "") {
+    return money(detail.buyer_paid_shipping_fee);
+  }
+  const actual = money(detail.actual_shipping_fee);
+  if (actual != null && actual > 0) return actual;
+  const estimated = money(detail.estimated_shipping_fee);
+  if (estimated != null && estimated > 0) return estimated;
+  return null;
+}
+
+function collectEscrowShipping(payload, into) {
+  const response = payload && payload.response != null ? payload.response : payload;
+  const rows = [];
+  if (Array.isArray(response)) rows.push(...response);
+  else if (response && typeof response === "object") {
+    if (Array.isArray(response.order_income_list)) rows.push(...response.order_income_list);
+    else rows.push(response);
+  }
+
+  for (const row of rows) {
+    const detail = (row && (row.escrow_detail || row)) || {};
+    const income = detail.order_income || row.order_income || {};
+    const orderSn = detail.order_sn || row.order_sn;
+    if (!orderSn || income.buyer_paid_shipping_fee == null || income.buyer_paid_shipping_fee === "") continue;
+    into.set(String(orderSn), money(income.buyer_paid_shipping_fee));
+  }
+}
+
+async function attachShopeeBuyerShipping(connection, details) {
+  const sns = details.map((row) => row && row.order_sn).filter(Boolean);
+  if (!sns.length) return;
+
+  const fees = new Map();
+  try {
+    const data = await shopeeRequest("POST", "/api/v2/payment/get_escrow_detail_batch", {
+      connection,
+      body: { order_sn_list: sns },
+    });
+    collectEscrowShipping(data, fees);
+  } catch (error) {
+    console.warn("Shopee escrow batch:", error.message);
+  }
+
+  for (const orderSn of sns) {
+    if (fees.has(String(orderSn))) continue;
+    try {
+      const data = await shopeeRequest("GET", "/api/v2/payment/get_escrow_detail", {
+        connection,
+        query: { order_sn: orderSn },
+      });
+      collectEscrowShipping(data, fees);
+    } catch (error) {
+      console.warn(`Shopee escrow ${orderSn}:`, error.message);
+    }
+  }
+
+  for (const row of details) {
+    const fee = fees.get(String(row.order_sn));
+    if (fee != null) row.buyer_paid_shipping_fee = fee;
+  }
+}
+
 function normalizeOrder(detail) {
   const recipient = detail.recipient_address || {};
   const items = Array.isArray(detail.item_list) ? detail.item_list : [];
+  const lines = items.map((item) => ({
+    sku: text(item.model_sku || item.item_sku || item.item_id, "-"),
+    name: text(item.item_name || item.model_name, "-"),
+    qty: Number(item.model_quantity_purchased || item.quantity || 1),
+    price: money(item.model_original_price || item.model_discounted_price),
+  }));
+  const totalAmount = money(detail.total_amount);
+  const amounts = splitOrderAmounts(lines, totalAmount, shopeeShipping(detail));
 
   return {
     platform: "Shopee",
     marketplaceOrderId: text(detail.order_sn),
-    customerName: text(detail.buyer_username || recipient.name, "-"),
-    customerPhone: text(recipient.phone),
-    shippingAddress: [recipient.full_address, recipient.city, recipient.state]
+    customerName: visibleText(recipient.name) || visibleText(detail.buyer_username, "-"),
+    customerPhone: visibleText(recipient.phone),
+    shippingAddress: [recipient.full_address, recipient.city, recipient.state, recipient.zipcode]
+      .map((part) => visibleText(part))
       .filter(Boolean)
       .join(" "),
     orderDate: toDate(detail.create_time),
     orderStatus: mapOrderStatus(detail.order_status),
+    platformStatus: text(detail.order_status),
     paymentMethod: text(detail.payment_method),
     shippingMethod: text(detail.shipping_carrier),
-    totalAmount: money(detail.total_amount),
+    totalAmount,
+    itemAmount: amounts.itemAmount,
+    discountAmount: amounts.discountAmount,
+    shippingAmount: amounts.shippingAmount,
     currency: text(detail.currency, "THB"),
-    lines: items.map((item) => ({
-      sku: text(item.model_sku || item.item_sku || item.item_id, "-"),
-      name: text(item.item_name || item.model_name, "-"),
-      qty: Number(item.model_quantity_purchased || item.quantity || 1),
-      price: money(item.model_original_price || item.model_discounted_price),
-    })),
+    lines,
   };
+}
+
+function recipientNeedsLookup(order) {
+  return !order.customerPhone || !order.shippingAddress || !order.customerName || order.customerName === "-";
+}
+
+async function fillShopeeRecipient(connection, detail) {
+  const current = normalizeOrder(detail);
+  if (!recipientNeedsLookup(current)) return current;
+
+  const packages = Array.isArray(detail.package_list) ? detail.package_list : [];
+  const packageNumber = packages[0] && packages[0].package_number;
+  try {
+    const data = await shopeeRequest("POST", "/api/v2/logistics/get_shipping_document_data_info", {
+      connection,
+      body: {
+        order_sn: detail.order_sn,
+        ...(packageNumber ? { package_number: packageNumber } : {}),
+      },
+    });
+    const info = (data.response && (data.response.shipping_document_info || data.response)) || {};
+    const recipient = info.recipient_address || info.recipient_address_info || {};
+    if (recipient.name || recipient.phone || recipient.full_address) {
+      detail.recipient_address = { ...(detail.recipient_address || {}), ...recipient };
+    }
+  } catch (error) {
+    console.warn(`Shopee recipient ${detail.order_sn}:`, error.message);
+  }
+
+  return normalizeOrder(detail);
 }
 
 function pickShopeeImage(item) {
@@ -429,13 +534,14 @@ async function fetchOrders(connection, options = {}) {
       query: {
         order_sn_list: batch.join(","),
         response_optional_fields:
-          "buyer_user_name,item_list,total_amount,recipient_address,payment_method,shipping_carrier",
+          "buyer_user_name,item_list,total_amount,recipient_address,payment_method,shipping_carrier,estimated_shipping_fee,actual_shipping_fee",
       },
     });
 
     const list = (detail.response && detail.response.order_list) || [];
+    await attachShopeeBuyerShipping(connection, list);
     for (const row of list) {
-      orders.push(normalizeOrder(row));
+      orders.push(await fillShopeeRecipient(connection, row));
     }
   }
 

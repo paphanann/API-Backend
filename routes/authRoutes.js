@@ -152,7 +152,7 @@ router.post("/login", async (req, res) => {
       user: {
         email: pick(row, ["Email", "Username"]) || login,
         name: pick(row, ["FullName", "Name"]) || login,
-        role: pick(row, ["Role"]) || "User",
+        role: String(pick(row, ["Role"]) || "User").trim().toLowerCase(),
       },
     });
   } catch (error) {
