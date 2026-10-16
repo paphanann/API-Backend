@@ -6,6 +6,7 @@ const tiktokService = require("../marketplaces/tiktokService");
 const lazadaService = require("../marketplaces/lazadaService");
 const { poolPromise } = require("../../config/database");
 const { isStickyConfigError } = require("../../utils/syncErrors");
+const { startTimer } = require("../../utils/timing");
 
 const services = {
   Shopee: shopeeService,
@@ -19,6 +20,10 @@ const DEFAULT_STICKY_BACKOFF_MS = 6 * 60 * 60 * 1000;
 
 let timer = null;
 let running = false;
+let queued = false;
+let currentJobId = null;
+/** @type {Map<string, object>} */
+const jobs = new Map();
 /** @type {Map<string, { until: number, reason: string }>} */
 const stickyBackoff = new Map();
 
@@ -78,8 +83,60 @@ async function recentlySyncedInDb(ms) {
   }
 }
 
+async function runPlatform(platform, options) {
+  const service = services[platform];
+  if (!service || typeof service.isConfigured !== "function" || !service.isConfigured()) {
+    return null;
+  }
+
+  if (!options.force) {
+    const blocked = stickyBlocked(platform);
+    if (blocked) {
+      console.log(`Auto-sync deferred: ${platform} until ${new Date(blocked.until).toISOString()}`);
+      return {
+        platform,
+        success: false,
+        skipped: true,
+        deferred: true,
+        message: `ข้ามชั่วคราว (config error): ${blocked.reason}`,
+      };
+    }
+  } else {
+    clearStickyBackoff(platform);
+  }
+
+  let shops;
+  try {
+    shops = await connectionStore.listConnected(platform);
+  } catch (error) {
+    return { platform, success: false, message: error.message };
+  }
+
+  if (!shops.length) return null;
+
+  const done = startTimer(`${platform} sync`);
+  try {
+    const result = await syncEngine.syncPlatform(platform, {
+      forceProducts: Boolean(options.forceProducts),
+    });
+    clearStickyBackoff(platform);
+    done(`orders=${result.orderCount} products=${result.productCount}`);
+    console.log(
+      `Auto-sync ok: ${platform} orders=${result.orderCount} products=${result.productCount} noop=${Boolean(result.noop)}`
+    );
+    return result;
+  } catch (error) {
+    done("error");
+    console.error(`Auto-sync failed: ${platform} -> ${error.message}`);
+    if (isStickyConfigError(error.message)) {
+      armStickyBackoff(platform, error.message);
+    }
+    return { platform, success: false, message: error.message };
+  }
+}
+
 async function syncAllConnected(options = {}) {
-  if (running) {
+  if ((running || queued) && !options.alreadyLocked) {
     return {
       skipped: true,
       reason: "already-running",
@@ -88,7 +145,7 @@ async function syncAllConnected(options = {}) {
     };
   }
 
-  if (!options.force && (await recentlySyncedInDb(cooldownMs()))) {
+  if (!options.force && !options.skipCooldown && (await recentlySyncedInDb(cooldownMs()))) {
     return {
       skipped: true,
       reason: "cooldown",
@@ -97,7 +154,8 @@ async function syncAllConnected(options = {}) {
     };
   }
 
-  running = true;
+  const lockedHere = !options.alreadyLocked;
+  if (lockedHere) running = true;
   const summary = {
     skipped: false,
     checked: 0,
@@ -110,83 +168,112 @@ async function syncAllConnected(options = {}) {
   };
 
   try {
-    for (const platform of ["Shopee", "TikTok", "Lazada"]) {
-      const service = services[platform];
-      if (!service || typeof service.isConfigured !== "function" || !service.isConfigured()) {
-        continue;
-      }
+    const batch = startTimer("sync platforms");
+    const outcomes = await Promise.allSettled(
+      ["Shopee", "TikTok", "Lazada"].map((platform) => runPlatform(platform, options))
+    );
+    batch();
 
-      if (!options.force) {
-        const blocked = stickyBlocked(platform);
-        if (blocked) {
-          summary.deferred += 1;
-          summary.results.push({
-            platform,
-            success: false,
-            skipped: true,
-            deferred: true,
-            message: `ข้ามชั่วคราว (config error): ${blocked.reason}`,
-          });
-          console.log(
-            `Auto-sync deferred: ${platform} until ${new Date(blocked.until).toISOString()}`
-          );
-          continue;
+    for (const outcome of outcomes) {
+      const result = outcome.status === "fulfilled" ? outcome.value : null;
+      if (!result) {
+        if (outcome.status === "rejected") {
+          summary.failed += 1;
+          summary.errors.push(outcome.reason && outcome.reason.message);
         }
-      } else {
-        clearStickyBackoff(platform);
-      }
-
-      let connection;
-      try {
-        connection = await connectionStore.getConnected(platform);
-      } catch (error) {
-        summary.failed += 1;
-        summary.errors.push(`${platform}: ${error.message}`);
-        summary.results.push({ platform, success: false, message: error.message });
         continue;
       }
-
-      if (!connection) continue;
-
-      if (platform === "TikTok" && !connection.shopCipher) {
-        summary.results.push({
-          platform,
-          success: false,
-          skipped: true,
-          message: "ยังไม่มี shop_cipher — ต้องเปิด scope แล้ว Connect ใหม่",
-        });
+      summary.results.push(result);
+      if (result.deferred) {
+        summary.deferred += 1;
         continue;
       }
-
+      if (result.skipped) continue;
       summary.checked += 1;
-
-      try {
-        const result = await syncEngine.syncPlatform(platform, {
-          forceProducts: Boolean(options.forceProducts),
-        });
-        clearStickyBackoff(platform);
-        if (result.noop) summary.noop += 1;
-        else summary.synced += 1;
-        summary.results.push(result);
-        console.log(
-          `Auto-sync ok: ${platform} orders=${result.orderCount} products=${result.productCount} noop=${Boolean(result.noop)}`
-        );
-      } catch (error) {
+      if (result.success === false) {
         summary.failed += 1;
-        summary.errors.push(`${platform}: ${error.message}`);
-        summary.results.push({ platform, success: false, message: error.message });
-        console.error(`Auto-sync failed: ${platform} -> ${error.message}`);
-
-        if (isStickyConfigError(error.message)) {
-          armStickyBackoff(platform, error.message);
-        }
+        summary.errors.push(`${result.platform}: ${result.message}`);
+        continue;
       }
+      if (result.noop) summary.noop += 1;
+      else summary.synced += 1;
     }
   } finally {
-    running = false;
+    if (lockedHere) running = false;
   }
 
   return summary;
+}
+
+function getSyncJob(jobId) {
+  return jobs.get(String(jobId)) || null;
+}
+
+function enqueueSync(options = {}) {
+  if (running || queued) {
+    return {
+      accepted: true,
+      alreadyRunning: true,
+      jobId: currentJobId,
+      status: "running",
+      message: "กำลัง sync อยู่แล้ว",
+    };
+  }
+
+  queued = true;
+  const jobId = Date.now().toString(36);
+  currentJobId = jobId;
+  const job = {
+    jobId,
+    status: "running",
+    startedAt: new Date().toISOString(),
+    platform: options.platform || null,
+    summary: null,
+    error: null,
+  };
+  jobs.set(jobId, job);
+  if (jobs.size > 20) {
+    const oldest = jobs.keys().next().value;
+    if (oldest && oldest !== jobId) jobs.delete(oldest);
+  }
+
+  setImmediate(() => {
+    running = true;
+    queued = false;
+    const work = options.platform
+      ? syncEngine
+          .syncPlatform(options.platform, { forceProducts: Boolean(options.forceProducts) })
+          .then((result) => ({ skipped: false, results: [result] }))
+      : syncAllConnected({
+          force: Boolean(options.force),
+          forceProducts: Boolean(options.forceProducts),
+          skipCooldown: Boolean(options.skipCooldown),
+          alreadyLocked: true,
+        });
+
+    work
+      .then((summary) => {
+        job.status = "done";
+        job.summary = summary;
+        job.finishedAt = new Date().toISOString();
+      })
+      .catch((error) => {
+        job.status = "error";
+        job.error = error.message;
+        job.finishedAt = new Date().toISOString();
+      })
+      .finally(() => {
+        running = false;
+        queued = false;
+      });
+  });
+
+  return {
+    accepted: true,
+    jobId,
+    status: "running",
+    message: "รับงานซิงก์แล้ว กำลังทำเบื้องหลัง",
+  };
 }
 
 function startOrderSyncJob() {
@@ -252,5 +339,7 @@ module.exports = {
   startOrderSyncJob,
   stopOrderSyncJob,
   syncAllConnected,
+  enqueueSync,
+  getSyncJob,
   clearStickyBackoff,
 };

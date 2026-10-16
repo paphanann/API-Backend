@@ -20,6 +20,10 @@ async function ensureSchema() {
         ALTER TABLE dbo.MarketplaceProduct ADD ImageUrl NVARCHAR(MAX) NULL;
       IF COL_LENGTH('dbo.MarketplaceProduct', 'VariantsJson') IS NULL
         ALTER TABLE dbo.MarketplaceProduct ADD VariantsJson NVARCHAR(MAX) NULL;
+      IF COL_LENGTH('dbo.MarketplaceProduct', 'ShopId') IS NULL
+        ALTER TABLE dbo.MarketplaceProduct ADD ShopId NVARCHAR(100) NULL;
+      IF COL_LENGTH('dbo.MarketplaceProduct', 'CompanyId') IS NULL
+        ALTER TABLE dbo.MarketplaceProduct ADD CompanyId NVARCHAR(100) NULL;
     END
 
     IF OBJECT_ID(N'dbo.SyncLog', N'U') IS NOT NULL
@@ -42,6 +46,8 @@ async function ensureSchema() {
         ALTER TABLE dbo.MarketplaceOrder ADD LastSyncedAt DATETIME2 NULL;
       IF COL_LENGTH('dbo.MarketplaceOrder', 'ShopId') IS NULL
         ALTER TABLE dbo.MarketplaceOrder ADD ShopId NVARCHAR(100) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'CompanyId') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD CompanyId NVARCHAR(100) NULL;
       IF COL_LENGTH('dbo.MarketplaceOrder', 'ItemAmount') IS NULL
         ALTER TABLE dbo.MarketplaceOrder ADD ItemAmount DECIMAL(18, 2) NULL;
       IF COL_LENGTH('dbo.MarketplaceOrder', 'DiscountAmount') IS NULL
@@ -50,6 +56,25 @@ async function ensureSchema() {
         ALTER TABLE dbo.MarketplaceOrder ADD ShippingAmount DECIMAL(18, 2) NULL;
       IF COL_LENGTH('dbo.MarketplaceOrder', 'PlatformStatus') IS NULL
         ALTER TABLE dbo.MarketplaceOrder ADD PlatformStatus NVARCHAR(80) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'ShopName') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD ShopName NVARCHAR(255) NULL;
+    END
+
+    IF OBJECT_ID(N'dbo.MarketplaceOrder', N'U') IS NOT NULL
+       AND OBJECT_ID(N'dbo.MarketplaceConnection', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.MarketplaceOrder', 'ShopName') IS NOT NULL
+    BEGIN
+      EXEC(N'
+        UPDATE o
+        SET ShopName = c.ShopName
+        FROM dbo.MarketplaceOrder o
+        INNER JOIN dbo.MarketplaceConnection c
+          ON c.Platform COLLATE DATABASE_DEFAULT = o.Platform COLLATE DATABASE_DEFAULT
+         AND ISNULL(c.CompanyId, N'''') COLLATE DATABASE_DEFAULT = ISNULL(o.CompanyId, N'''') COLLATE DATABASE_DEFAULT
+         AND ISNULL(c.ShopId, N'''') COLLATE DATABASE_DEFAULT = ISNULL(o.ShopId, N'''') COLLATE DATABASE_DEFAULT
+        WHERE c.ShopName IS NOT NULL
+          AND ISNULL(o.ShopName, N'''') = N''''
+      ');
     END
 
     IF OBJECT_ID(N'dbo.MarketplaceConnection', N'U') IS NULL
@@ -88,6 +113,9 @@ async function ensureSchema() {
     IF COL_LENGTH('dbo.MarketplaceConnection', 'AuthorizedAt') IS NULL
       ALTER TABLE dbo.MarketplaceConnection ADD AuthorizedAt DATETIME2 NULL;
 
+    IF COL_LENGTH('dbo.MarketplaceConnection', 'CompanyId') IS NULL
+      ALTER TABLE dbo.MarketplaceConnection ADD CompanyId NVARCHAR(100) NULL;
+
     IF COL_LENGTH('dbo.MarketplaceConnection', 'LastRefreshAt') IS NULL
       ALTER TABLE dbo.MarketplaceConnection ADD LastRefreshAt DATETIME2 NULL;
 
@@ -95,27 +123,15 @@ async function ensureSchema() {
     SET AuthorizedAt = COALESCE(AuthorizedAt, CreatedAt, UpdatedAt)
     WHERE AuthorizedAt IS NULL;
 
-    -- ลบแถวซ้ำ: เหลือแค่ ConnectionId ล่าสุดต่อ Platform (กัน TikTok/Shopee เบิ้ลจาก reconnect)
-    ;WITH ranked AS (
-      SELECT
-        ConnectionId,
-        ROW_NUMBER() OVER (
-          PARTITION BY Platform
-          ORDER BY UpdatedAt DESC, ConnectionId DESC
-        ) AS rn
-      FROM dbo.MarketplaceConnection
-    )
-    DELETE FROM ranked WHERE rn > 1;
-
-    IF NOT EXISTS (
+    -- ดัชนีไม่ซ้ำของร้านย้ายไปคู่ CompanyId + Platform + ShopId ในแบตช์ถัดไป
+    IF EXISTS (
       SELECT 1
       FROM sys.indexes
       WHERE name = N'UX_MarketplaceConnection_Platform'
         AND object_id = OBJECT_ID(N'dbo.MarketplaceConnection')
     )
     BEGIN
-      CREATE UNIQUE INDEX UX_MarketplaceConnection_Platform
-        ON dbo.MarketplaceConnection (Platform);
+      DROP INDEX UX_MarketplaceConnection_Platform ON dbo.MarketplaceConnection;
     END
 
     -- ย้ายครั้งแรกจากตารางเก่า ถ้าตารางใหม่ยังว่าง
@@ -192,6 +208,43 @@ async function ensureSchema() {
   `);
 
   await pool.request().query(`
+    DECLARE @company NVARCHAR(100);
+    SELECT @company = COALESCE(
+      NULLIF(LTRIM(RTRIM(JSON_VALUE(SettingsJson, '$.companyCode'))), N''),
+      NULLIF(LTRIM(RTRIM(JSON_VALUE(SettingsJson, '$.database'))), N''),
+      N'default'
+    )
+    FROM dbo.AppSettings
+    WHERE Id = 1;
+    IF @company IS NULL SET @company = N'default';
+
+    IF COL_LENGTH('dbo.MarketplaceConnection', 'CompanyId') IS NOT NULL
+      UPDATE dbo.MarketplaceConnection SET CompanyId = @company WHERE CompanyId IS NULL;
+    IF COL_LENGTH('dbo.MarketplaceOrder', 'CompanyId') IS NOT NULL
+      UPDATE dbo.MarketplaceOrder SET CompanyId = @company WHERE CompanyId IS NULL;
+    IF COL_LENGTH('dbo.MarketplaceProduct', 'CompanyId') IS NOT NULL
+      UPDATE dbo.MarketplaceProduct SET CompanyId = @company WHERE CompanyId IS NULL;
+
+    IF EXISTS (
+      SELECT 1 FROM sys.indexes
+      WHERE name = N'UX_MarketplaceConnection_Platform_ShopId'
+        AND object_id = OBJECT_ID(N'dbo.MarketplaceConnection')
+    )
+      DROP INDEX UX_MarketplaceConnection_Platform_ShopId ON dbo.MarketplaceConnection;
+
+    IF OBJECT_ID(N'dbo.MarketplaceConnection', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.MarketplaceConnection', 'CompanyId') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'UX_MarketplaceConnection_Company_Platform_Shop'
+           AND object_id = OBJECT_ID(N'dbo.MarketplaceConnection')
+       )
+      CREATE UNIQUE INDEX UX_MarketplaceConnection_Company_Platform_Shop
+        ON dbo.MarketplaceConnection (CompanyId, Platform, ShopId)
+        WHERE CompanyId IS NOT NULL AND ShopId IS NOT NULL;
+  `);
+
+  await pool.request().query(`
     IF OBJECT_ID(N'dbo.SyncLog', N'U') IS NOT NULL
        AND COL_LENGTH('dbo.SyncLog', 'SyncRunId') IS NOT NULL
        AND NOT EXISTS (
@@ -213,10 +266,148 @@ async function ensureSchema() {
     SET o.ShopId = c.ShopId
     FROM dbo.MarketplaceOrder o
     INNER JOIN dbo.MarketplaceConnection c
-      ON c.Platform = o.Platform
+      ON c.Platform COLLATE DATABASE_DEFAULT = o.Platform COLLATE DATABASE_DEFAULT
      AND UPPER(c.ConnectionStatus) = N'CONNECTED'
      AND c.ShopId IS NOT NULL
     WHERE o.ShopId IS NULL
+      AND (
+        SELECT COUNT(*)
+        FROM dbo.MarketplaceConnection c2
+        WHERE c2.Platform COLLATE DATABASE_DEFAULT = o.Platform COLLATE DATABASE_DEFAULT
+          AND UPPER(c2.ConnectionStatus) = N'CONNECTED'
+          AND c2.ShopId IS NOT NULL
+      ) = 1
+  `);
+
+  await pool.request().query(`
+    IF OBJECT_ID(N'dbo.MarketplaceOrder', N'U') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'IX_MarketplaceOrder_Platform_OrderId'
+           AND object_id = OBJECT_ID(N'dbo.MarketplaceOrder')
+       )
+      CREATE INDEX IX_MarketplaceOrder_Platform_OrderId
+        ON dbo.MarketplaceOrder (Platform, MarketplaceOrderId, ShopId);
+
+    IF OBJECT_ID(N'dbo.MarketplaceOrder', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.MarketplaceOrder', 'CompanyId') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'UX_MarketplaceOrder_Company_Platform_Shop_Order'
+           AND object_id = OBJECT_ID(N'dbo.MarketplaceOrder')
+       )
+      CREATE UNIQUE INDEX UX_MarketplaceOrder_Company_Platform_Shop_Order
+        ON dbo.MarketplaceOrder (CompanyId, Platform, ShopId, MarketplaceOrderId)
+        WHERE CompanyId IS NOT NULL AND ShopId IS NOT NULL AND MarketplaceOrderId IS NOT NULL;
+
+    IF OBJECT_ID(N'dbo.MarketplaceOrder', N'U') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'IX_MarketplaceOrder_OrderDate'
+           AND object_id = OBJECT_ID(N'dbo.MarketplaceOrder')
+       )
+      CREATE INDEX IX_MarketplaceOrder_OrderDate
+        ON dbo.MarketplaceOrder (OrderDate DESC);
+
+    IF OBJECT_ID(N'dbo.MarketplaceConnection', N'U') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'IX_MarketplaceConnection_LastSyncAt'
+           AND object_id = OBJECT_ID(N'dbo.MarketplaceConnection')
+       )
+      CREATE INDEX IX_MarketplaceConnection_LastSyncAt
+        ON dbo.MarketplaceConnection (LastSyncAt);
+
+    IF OBJECT_ID(N'dbo.SyncLog', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.SyncLog', 'StartTime') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'IX_SyncLog_StartTime'
+           AND object_id = OBJECT_ID(N'dbo.SyncLog')
+       )
+      CREATE INDEX IX_SyncLog_StartTime
+        ON dbo.SyncLog (StartTime DESC);
+
+    IF OBJECT_ID(N'dbo.SyncLog', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.SyncLog', 'ParentSyncRunId') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'IX_SyncLog_Parent'
+           AND object_id = OBJECT_ID(N'dbo.SyncLog')
+       )
+      CREATE INDEX IX_SyncLog_Parent
+        ON dbo.SyncLog (ParentSyncRunId, Status);
+
+    IF OBJECT_ID(N'dbo.MarketplaceProduct', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.MarketplaceProduct', 'ShopId') IS NOT NULL
+    BEGIN
+      UPDATE p
+      SET p.ShopId = c.ShopId
+      FROM dbo.MarketplaceProduct p
+      INNER JOIN dbo.MarketplaceConnection c
+        ON c.Platform COLLATE DATABASE_DEFAULT = p.Platform COLLATE DATABASE_DEFAULT
+       AND c.ShopId IS NOT NULL
+      WHERE p.ShopId IS NULL
+        AND (
+          SELECT COUNT(*)
+          FROM dbo.MarketplaceConnection c2
+          WHERE c2.Platform COLLATE DATABASE_DEFAULT = p.Platform COLLATE DATABASE_DEFAULT
+            AND c2.ShopId IS NOT NULL
+        ) = 1;
+    END
+
+    IF OBJECT_ID(N'dbo.MarketplaceProduct', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.MarketplaceProduct', 'ShopId') IS NOT NULL
+       AND COL_LENGTH('dbo.MarketplaceConnection', 'ShopId') IS NOT NULL
+    BEGIN
+      DECLARE @shopCollation sysname;
+      DECLARE @productShopCollation sysname;
+      SELECT @shopCollation = collation_name
+      FROM sys.columns
+      WHERE object_id = OBJECT_ID(N'dbo.MarketplaceConnection')
+        AND name = N'ShopId';
+      SELECT @productShopCollation = collation_name
+      FROM sys.columns
+      WHERE object_id = OBJECT_ID(N'dbo.MarketplaceProduct')
+        AND name = N'ShopId';
+
+      IF @shopCollation IS NOT NULL
+         AND @productShopCollation IS NOT NULL
+         AND @shopCollation <> @productShopCollation
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM sys.indexes
+          WHERE name = N'IX_MarketplaceProduct_Platform_Shop_Product'
+            AND object_id = OBJECT_ID(N'dbo.MarketplaceProduct')
+        )
+          DROP INDEX IX_MarketplaceProduct_Platform_Shop_Product ON dbo.MarketplaceProduct;
+
+        DECLARE @alignShop nvarchar(400) =
+          N'ALTER TABLE dbo.MarketplaceProduct ALTER COLUMN ShopId NVARCHAR(100) COLLATE '
+          + @shopCollation + N' NULL';
+        EXEC sp_executesql @alignShop;
+      END
+    END
+
+    IF OBJECT_ID(N'dbo.MarketplaceProduct', N'U') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'IX_MarketplaceProduct_Platform_Shop_Product'
+           AND object_id = OBJECT_ID(N'dbo.MarketplaceProduct')
+       )
+      CREATE INDEX IX_MarketplaceProduct_Platform_Shop_Product
+        ON dbo.MarketplaceProduct (Platform, ShopId, ProductId);
+
+    IF OBJECT_ID(N'dbo.MarketplaceProduct', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.MarketplaceProduct', 'CompanyId') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'UX_MarketplaceProduct_Company_Platform_Shop_Product'
+           AND object_id = OBJECT_ID(N'dbo.MarketplaceProduct')
+       )
+      CREATE UNIQUE INDEX UX_MarketplaceProduct_Company_Platform_Shop_Product
+        ON dbo.MarketplaceProduct (CompanyId, Platform, ShopId, ProductId)
+        WHERE CompanyId IS NOT NULL AND ShopId IS NOT NULL AND ProductId IS NOT NULL;
   `);
 
   await repairConnectionExpiries(pool);
@@ -281,6 +472,133 @@ async function repairConnectionExpiries(pool) {
         ` refresh=${refresh ? refresh.toISOString() : "null"}`
     );
   }
+
+  await moveShopNameBesidePlatform(pool);
+  await alignOrderKeyCollation(pool);
+}
+
+async function moveShopNameBesidePlatform(pool) {
+  const pos = await pool.request().query(`
+    SELECT name, column_id
+    FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'dbo.MarketplaceOrder')
+      AND name IN (N'Platform', N'ShopName')
+  `);
+  const platform = pos.recordset.find((row) => row.name === "Platform");
+  const shop = pos.recordset.find((row) => row.name === "ShopName");
+  if (!platform || !shop || Number(shop.column_id) === Number(platform.column_id) + 1) {
+    return;
+  }
+
+  const before = await pool.request().query(`SELECT COUNT(1) AS n FROM dbo.MarketplaceOrder`);
+  const expected = before.recordset[0].n;
+
+  await pool.request().query(`
+    IF OBJECT_ID(N'dbo.MarketplaceOrder_Reorder', N'U') IS NOT NULL
+      DROP TABLE dbo.MarketplaceOrder_Reorder;
+
+    CREATE TABLE dbo.MarketplaceOrder_Reorder
+    (
+      Id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+      Platform NVARCHAR(50) NOT NULL,
+      ShopName NVARCHAR(255) NULL,
+      MarketplaceOrderId NVARCHAR(100) NOT NULL,
+      CustomerName NVARCHAR(255) NULL,
+      OrderDate DATETIME NULL,
+      OrderStatus NVARCHAR(50) NULL,
+      TotalAmount DECIMAL(18, 2) NULL,
+      Currency NVARCHAR(10) NULL,
+      SyncStatus NVARCHAR(50) NULL,
+      SapDocNum NVARCHAR(50) NULL,
+      CustomerPhone NVARCHAR(50) NULL,
+      ShippingAddress NVARCHAR(500) NULL,
+      PaymentMethod NVARCHAR(100) NULL,
+      ShippingMethod NVARCHAR(100) NULL,
+      ItemsJson NVARCHAR(MAX) NULL,
+      LastSyncedAt DATETIME2 NULL,
+      ShopId NVARCHAR(100) NULL,
+      ItemAmount DECIMAL(18, 2) NULL,
+      DiscountAmount DECIMAL(18, 2) NULL,
+      ShippingAmount DECIMAL(18, 2) NULL,
+      PlatformStatus NVARCHAR(80) NULL,
+      CompanyId NVARCHAR(100) NULL
+    );
+  `);
+
+  await pool.request().query(`
+    SET IDENTITY_INSERT dbo.MarketplaceOrder_Reorder ON;
+    INSERT INTO dbo.MarketplaceOrder_Reorder (
+      Id, Platform, ShopName, MarketplaceOrderId, CustomerName, OrderDate, OrderStatus,
+      TotalAmount, Currency, SyncStatus, SapDocNum, CustomerPhone, ShippingAddress,
+      PaymentMethod, ShippingMethod, ItemsJson, LastSyncedAt, ShopId, ItemAmount,
+      DiscountAmount, ShippingAmount, PlatformStatus, CompanyId
+    )
+    SELECT
+      Id, Platform, ShopName, MarketplaceOrderId, CustomerName, OrderDate, OrderStatus,
+      TotalAmount, Currency, SyncStatus, SapDocNum, CustomerPhone, ShippingAddress,
+      PaymentMethod, ShippingMethod, ItemsJson, LastSyncedAt, ShopId, ItemAmount,
+      DiscountAmount, ShippingAmount, PlatformStatus, CompanyId
+    FROM dbo.MarketplaceOrder;
+    SET IDENTITY_INSERT dbo.MarketplaceOrder_Reorder OFF;
+  `);
+
+  const copied = await pool.request().query(`SELECT COUNT(1) AS n FROM dbo.MarketplaceOrder_Reorder`);
+  if (copied.recordset[0].n !== expected) {
+    await pool.request().query(`DROP TABLE dbo.MarketplaceOrder_Reorder`);
+    throw new Error(`ย้ายคอลัมน์ ShopName ไม่ครบ ${copied.recordset[0].n}/${expected}`);
+  }
+
+  await pool.request().query(`
+    DROP TABLE dbo.MarketplaceOrder;
+    EXEC sp_rename N'dbo.MarketplaceOrder_Reorder', N'MarketplaceOrder';
+
+    CREATE INDEX IX_MarketplaceOrder_Platform_OrderId
+      ON dbo.MarketplaceOrder (Platform, MarketplaceOrderId, ShopId);
+    CREATE UNIQUE INDEX UX_MarketplaceOrder_Company_Platform_Shop_Order
+      ON dbo.MarketplaceOrder (CompanyId, Platform, ShopId, MarketplaceOrderId)
+      WHERE CompanyId IS NOT NULL AND ShopId IS NOT NULL AND MarketplaceOrderId IS NOT NULL;
+    CREATE INDEX IX_MarketplaceOrder_OrderDate
+      ON dbo.MarketplaceOrder (OrderDate DESC);
+    DBCC CHECKIDENT (N'dbo.MarketplaceOrder', RESEED);
+  `);
+}
+
+async function alignOrderKeyCollation(pool) {
+  const row = await pool.request().query(`
+    SELECT collation_name
+    FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'dbo.MarketplaceOrder')
+      AND name = N'Platform'
+  `);
+  const current = row.recordset[0] && row.recordset[0].collation_name;
+  if (!current || current === "SQL_Latin1_General_CP850_CI_AS") return;
+
+  await pool.request().query(`
+    IF EXISTS (
+      SELECT 1 FROM sys.indexes
+      WHERE name = N'IX_MarketplaceOrder_Platform_OrderId'
+        AND object_id = OBJECT_ID(N'dbo.MarketplaceOrder')
+    )
+      DROP INDEX IX_MarketplaceOrder_Platform_OrderId ON dbo.MarketplaceOrder;
+
+    IF EXISTS (
+      SELECT 1 FROM sys.indexes
+      WHERE name = N'UX_MarketplaceOrder_Company_Platform_Shop_Order'
+        AND object_id = OBJECT_ID(N'dbo.MarketplaceOrder')
+    )
+      DROP INDEX UX_MarketplaceOrder_Company_Platform_Shop_Order ON dbo.MarketplaceOrder;
+
+    ALTER TABLE dbo.MarketplaceOrder ALTER COLUMN Platform NVARCHAR(50) COLLATE SQL_Latin1_General_CP850_CI_AS NOT NULL;
+    ALTER TABLE dbo.MarketplaceOrder ALTER COLUMN ShopName NVARCHAR(255) COLLATE SQL_Latin1_General_CP850_CI_AS NULL;
+    ALTER TABLE dbo.MarketplaceOrder ALTER COLUMN MarketplaceOrderId NVARCHAR(100) COLLATE SQL_Latin1_General_CP850_CI_AS NOT NULL;
+    ALTER TABLE dbo.MarketplaceOrder ALTER COLUMN ShopId NVARCHAR(100) COLLATE SQL_Latin1_General_CP850_CI_AS NULL;
+
+    CREATE INDEX IX_MarketplaceOrder_Platform_OrderId
+      ON dbo.MarketplaceOrder (Platform, MarketplaceOrderId, ShopId);
+    CREATE UNIQUE INDEX UX_MarketplaceOrder_Company_Platform_Shop_Order
+      ON dbo.MarketplaceOrder (CompanyId, Platform, ShopId, MarketplaceOrderId)
+      WHERE CompanyId IS NOT NULL AND ShopId IS NOT NULL AND MarketplaceOrderId IS NOT NULL;
+  `);
 }
 
 module.exports = {

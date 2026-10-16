@@ -1,9 +1,62 @@
 const https = require("https");
 const express = require("express");
 const axios = require("axios");
+const { Connection, Request } = require("tedious");
 
 const settingsStore = require("../services/stores/settingsStore");
+const sapService = require("../services/marketplaces/sapService");
 const { publicError } = require("../utils/normalize");
+
+function listSqlDatabases({ host, port, username, password }) {
+  return new Promise((resolve, reject) => {
+    const connection = new Connection({
+      server: host,
+      authentication: {
+        type: "default",
+        options: { userName: username, password },
+      },
+      options: {
+        port: Number(port) || 1433,
+        database: "master",
+        encrypt: true,
+        trustServerCertificate: true,
+        connectTimeout: 8000,
+        requestTimeout: 8000,
+      },
+    });
+    const names = [];
+    const fail = (error) => {
+      connection.close();
+      reject(error);
+    };
+
+    connection.on("connect", (error) => {
+      if (error) {
+        fail(error);
+        return;
+      }
+
+      const request = new Request(
+        "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0 ORDER BY name",
+        (queryError) => {
+          connection.close();
+          if (queryError) {
+            reject(queryError);
+            return;
+          }
+          resolve(names.map((name) => ({ name })));
+        }
+      );
+      request.on("row", (columns) => {
+        const value = columns[0] && columns[0].value;
+        if (value) names.push(String(value));
+      });
+      connection.execSql(request);
+    });
+
+    connection.connect();
+  });
+}
 
 const router = express.Router();
 
@@ -40,6 +93,39 @@ router.post("/", async (req, res) => {
 router.post("/test-erp", async (req, res) => {
   try {
     const body = req.body || {};
+    const host = String(body.host || "").trim();
+    const username = String(body.username || "").trim();
+    const password = String(body.password || "");
+
+    if (host) {
+      if (!username || !password) {
+        return res.status(400).json({
+          success: false,
+          message: "กรอก Server, ชื่อผู้ใช้ และรหัสผ่านให้ครบก่อนทดสอบ",
+        });
+      }
+
+      try {
+        const databases = await listSqlDatabases({
+          host,
+          port: body.port,
+          username,
+          password,
+        });
+        return res.json({
+          success: true,
+          message: `เชื่อมต่อ SQL Server สำเร็จ (${host})`,
+          databases,
+        });
+      } catch (error) {
+        console.error("SQL test failed:", error.message);
+        return res.status(400).json({
+          success: false,
+          message: publicError(error, "เชื่อมต่อ SQL Server ไม่สำเร็จ"),
+        });
+      }
+    }
+
     const creds = await settingsStore.getErpCredentials(body);
 
     if (!creds.baseUrl || !creds.companyDb || !creds.username || !creds.password) {
@@ -95,6 +181,19 @@ router.post("/test-erp", async (req, res) => {
       success: false,
       message: publicError(error, "ทดสอบ ERP ไม่สำเร็จ"),
     });
+  }
+});
+
+router.get("/sap-items", async (req, res) => {
+  try {
+    if (!sapService.isConfigured()) {
+      return res.status(400).json({ message: "ยังไม่ได้ตั้งค่า SAP" });
+    }
+    const items = await sapService.listStockItems();
+    res.json({ items });
+  } catch (error) {
+    console.error("SAP items failed:", error.message);
+    res.status(500).json({ message: publicError(error, "ดึงสินค้าจาก SAP ไม่สำเร็จ") });
   }
 });
 

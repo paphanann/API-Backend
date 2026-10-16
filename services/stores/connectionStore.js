@@ -1,5 +1,6 @@
 const { poolPromise, sql } = require("../../config/database");
 const { ensureSchema } = require("./schema");
+const { currentCompanyId } = require("./companyContext");
 const tokenService = require("../tokenService");
 
 function defaultUserId() {
@@ -43,13 +44,14 @@ async function saveConnection(fields) {
   await ensureSchema();
   const pool = await poolPromise;
   const shopId = fields.shopId ? String(fields.shopId) : "unknown";
+  const companyId = fields.companyId ? String(fields.companyId) : await currentCompanyId();
   const userId = fields.userId || defaultUserId();
   const sellerId = fields.sellerId || fields.openId || null;
 
-  // ระบบนี้เก็บ 1 ร้านต่อแพลตฟอร์ม — upsert ตาม Platform อย่างเดียว
-  // (reconnect แล้ว ShopId เปลี่ยน จะอัปเดตแถวเดิม ไม่สร้างแถวใหม่ที่ไม่มี token)
+  // จับคู่ร้านเดิมจากบริษัท + แพลตฟอร์ม + Shop ID ไม่สร้างซ้ำ และไม่ทับร้านอื่น
   await pool
     .request()
+    .input("companyId", sql.NVarChar(100), companyId)
     .input("userId", sql.Int, userId)
     .input("platform", sql.NVarChar(50), fields.platform)
     .input("shopId", sql.NVarChar(100), shopId)
@@ -62,6 +64,8 @@ async function saveConnection(fields) {
         SELECT TOP 1 ConnectionId
         FROM dbo.MarketplaceConnection
         WHERE Platform = @platform
+          AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
+          AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
         ORDER BY UpdatedAt DESC, ConnectionId DESC
       );
 
@@ -69,6 +73,7 @@ async function saveConnection(fields) {
       BEGIN
         UPDATE dbo.MarketplaceConnection
         SET
+          CompanyId = @companyId,
           UserId = @userId,
           ShopId = @shopId,
           ShopName = COALESCE(@shopName, ShopName),
@@ -78,16 +83,12 @@ async function saveConnection(fields) {
           AuthorizedAt = GETDATE(),
           UpdatedAt = GETDATE()
         WHERE ConnectionId = @id;
-
-        -- ลบแถวซ้ำของแพลตฟอร์มเดียวกัน (กันข้อมูลเบิ้ลจาก reconnect เก่า)
-        DELETE FROM dbo.MarketplaceConnection
-        WHERE Platform = @platform
-          AND ConnectionId <> @id;
       END
       ELSE
       BEGIN
         INSERT INTO dbo.MarketplaceConnection
         (
+          CompanyId,
           UserId,
           Platform,
           ShopId,
@@ -101,6 +102,7 @@ async function saveConnection(fields) {
         )
         VALUES
         (
+          @companyId,
           @userId,
           @platform,
           @shopId,
@@ -117,6 +119,7 @@ async function saveConnection(fields) {
 
   await tokenService.saveTokens({
     platform: fields.platform,
+    companyId,
     shopId,
     accessToken: fields.accessToken,
     refreshToken: fields.refreshToken,
@@ -132,9 +135,14 @@ async function updateConnectedShop(platform, fields) {
   await ensureSchema();
   const pool = await poolPromise;
   const shopId = fields.shopId ? String(fields.shopId) : null;
+  const companyId = fields.companyId ? String(fields.companyId) : await currentCompanyId();
   const sellerId = fields.sellerId || fields.openId || null;
 
-  const current = await getConnected(platform);
+  const fromShopId = fields.fromShopId ? String(fields.fromShopId) : null;
+  const current = fromShopId
+    ? (await listConnected(platform)).find((row) => String(row.shopId || "") === fromShopId) ||
+      (await getConnection(platform, fromShopId))
+    : await getConnected(platform);
   if (!current) {
     return saveConnection({ platform, ...fields });
   }
@@ -144,6 +152,7 @@ async function updateConnectedShop(platform, fields) {
 
   await pool
     .request()
+    .input("companyId", sql.NVarChar(100), companyId)
     .input("platform", sql.NVarChar(50), platform)
     .input("oldShopId", sql.NVarChar(100), oldShopId)
     .input("shopId", sql.NVarChar(100), nextShopId)
@@ -159,12 +168,14 @@ async function updateConnectedShop(platform, fields) {
         AuthorizedAt = COALESCE(AuthorizedAt, GETDATE()),
         UpdatedAt = GETDATE()
       WHERE Platform = @platform
+        AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
         AND ISNULL(ShopId, N'') = ISNULL(@oldShopId, N'')
     `);
 
   if (fields.accessToken) {
     await tokenService.saveTokens({
       platform,
+      companyId,
       shopId: nextShopId,
       accessToken: fields.accessToken,
       refreshToken: fields.refreshToken || current.refreshToken,
@@ -179,23 +190,56 @@ async function updateConnectedShop(platform, fields) {
   );
 }
 
-async function getConnected(platform) {
+async function getConnection(platform, shopId, companyId) {
   await ensureSchema();
   const pool = await poolPromise;
-
+  const company = companyId ? String(companyId) : await currentCompanyId();
   const result = await pool
     .request()
+    .input("companyId", sql.NVarChar(100), company)
     .input("platform", sql.NVarChar(50), platform)
+    .input("shopId", sql.NVarChar(100), String(shopId || ""))
     .query(`
       SELECT TOP 1 *
       FROM dbo.MarketplaceConnection
       WHERE Platform = @platform
-        AND UPPER(ConnectionStatus) = N'CONNECTED'
-      ORDER BY UpdatedAt DESC
+        AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
+        AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
+      ORDER BY UpdatedAt DESC, ConnectionId DESC
     `);
 
   const row = result.recordset[0];
   return row ? reveal(row) : null;
+}
+
+async function listConnected(platform) {
+  await ensureSchema();
+  const pool = await poolPromise;
+  const request = pool.request().input("companyId", sql.NVarChar(100), await currentCompanyId());
+  let where = `
+    WHERE ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
+      AND UPPER(ConnectionStatus) = N'CONNECTED'
+      AND AccessToken IS NOT NULL
+      AND LEN(AccessToken) > 0
+  `;
+  if (platform) {
+    request.input("platform", sql.NVarChar(50), platform);
+    where += " AND Platform = @platform";
+  }
+
+  const result = await request.query(`
+    SELECT *
+    FROM dbo.MarketplaceConnection
+    ${where}
+    ORDER BY Platform, ShopName, ConnectionId
+  `);
+
+  return result.recordset.map(reveal);
+}
+
+async function getConnected(platform) {
+  const rows = await listConnected(platform);
+  return rows[0] || null;
 }
 
 function reveal(row) {
@@ -204,6 +248,7 @@ function reveal(row) {
   return {
     id: row.ConnectionId || row.AuthorizationId || row.Id,
     userId: row.UserId,
+    companyId: row.CompanyId || null,
     platform: row.Platform,
     shopId: row.ShopId,
     shopName: row.ShopName,
@@ -234,15 +279,18 @@ async function updateTokens(connection, tokens) {
 
 async function touchSync(connection) {
   const pool = await poolPromise;
+  const companyId = connection.companyId ? String(connection.companyId) : await currentCompanyId();
 
   await pool
     .request()
+    .input("companyId", sql.NVarChar(100), companyId)
     .input("platform", sql.NVarChar(50), connection.platform)
     .input("shopId", sql.NVarChar(100), String(connection.shopId || ""))
     .query(`
       UPDATE dbo.MarketplaceConnection
       SET LastSyncAt = GETDATE(), UpdatedAt = GETDATE()
       WHERE Platform = @platform
+        AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
         AND ShopId = @shopId
     `);
 }
@@ -250,10 +298,12 @@ async function touchSync(connection) {
 async function listPublicConnections() {
   await ensureSchema();
   const pool = await poolPromise;
+  const companyId = await currentCompanyId();
 
-  const result = await pool.request().query(`
+  const result = await pool.request().input("companyId", sql.NVarChar(100), companyId).query(`
     SELECT
       ConnectionId AS Id,
+      CompanyId,
       Platform,
       ShopId,
       ShopName,
@@ -269,14 +319,16 @@ async function listPublicConnections() {
       AccessTokenExpiresAt,
       RefreshTokenExpiresAt
     FROM dbo.MarketplaceConnection
+    WHERE ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
     ORDER BY UpdatedAt DESC
   `);
 
-  const byPlatform = new Map();
+  const shops = [];
 
   for (const row of result.recordset) {
     const platform = String(row.Platform || "").trim();
-    if (!platform || byPlatform.has(platform.toLowerCase())) {
+    const shopId = row.ShopId || row.SellerId || null;
+    if (!platform || !shopId) {
       continue;
     }
 
@@ -295,12 +347,14 @@ async function listPublicConnections() {
       (!hasAccess || refreshExpired === true || tiktokMissingCipher);
     const connected = looksConnected && hasAccess && !needsReauth;
 
-    byPlatform.set(platform.toLowerCase(), {
+    shops.push({
       Id: row.Id,
+      CompanyId: row.CompanyId || companyId,
+      companyId: row.CompanyId || companyId,
       Platform: platform,
       platform,
-      ShopId: row.ShopId || row.SellerId || null,
-      shopId: row.ShopId || row.SellerId || null,
+      ShopId: shopId,
+      shopId,
       ShopName: row.ShopName || null,
       shopName: row.ShopName || null,
       SellerId: row.SellerId || null,
@@ -324,19 +378,20 @@ async function listPublicConnections() {
       Message: tiktokMissingCipher
         ? "TikTok ยังไม่มี shop_cipher — เปิด scope ใน Partner Center แล้ว Connect ใหม่"
         : null,
-      // ให้หน้าบ้านรู้ว่าตัดการเชื่อมแล้วจริง ไม่โชว์ชื่อร้านค้างเป็น needsReauth
-      Cleared: connected || needsReauth ? 0 : 1,
+      Cleared: 0,
     });
   }
 
   const platforms = ["Shopee", "TikTok", "Lazada"];
-  return platforms.map((platform) => {
-    const existing = byPlatform.get(platform.toLowerCase());
-    if (existing) {
-      return existing;
+  for (const platform of platforms) {
+    const hasShop = shops.some((row) => String(row.Platform).toLowerCase() === platform.toLowerCase());
+    if (hasShop) {
+      continue;
     }
 
-    return {
+    shops.push({
+      CompanyId: companyId,
+      companyId,
       Platform: platform,
       platform,
       ShopId: null,
@@ -356,12 +411,43 @@ async function listPublicConnections() {
       HasRefreshToken: 0,
       NeedsReauth: 0,
       TokenExpired: 0,
-    };
-  });
+      Cleared: 1,
+    });
+  }
+
+  return shops;
 }
 
-async function disconnectPlatform(platform) {
-  await tokenService.clearTokens(platform);
+async function disconnectPlatform(platform, shopId) {
+  await tokenService.clearTokens(platform, shopId);
+}
+
+async function deleteShop(platform, shopId) {
+  await ensureSchema();
+  const pool = await poolPromise;
+  const request = pool
+    .request()
+    .input("companyId", sql.NVarChar(100), await currentCompanyId())
+    .input("platform", sql.NVarChar(50), String(platform || "").trim());
+
+  const result = shopId
+    ? await request.input("shopId", sql.NVarChar(100), String(shopId)).query(`
+        DELETE FROM dbo.MarketplaceConnection
+        WHERE Platform = @platform
+          AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
+          AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'');
+        SELECT @@ROWCOUNT AS Deleted;
+      `)
+    : await request.query(`
+        DELETE FROM dbo.MarketplaceConnection
+        WHERE Platform = @platform
+          AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'');
+        SELECT @@ROWCOUNT AS Deleted;
+      `);
+
+  const deleted = Number(result.recordset && result.recordset[0] && result.recordset[0].Deleted) || 0;
+  console.log(`Deleted marketplace shop: ${platform}${shopId ? ` shop=${shopId}` : ""} rows=${deleted}`);
+  return deleted;
 }
 
 function assertLiveToken(accessToken) {
@@ -371,10 +457,13 @@ function assertLiveToken(accessToken) {
 module.exports = {
   saveConnection,
   updateConnectedShop,
+  getConnection,
+  listConnected,
   getConnected,
   updateTokens,
   touchSync,
   listPublicConnections,
   disconnectPlatform,
+  deleteShop,
   assertLiveToken,
 };

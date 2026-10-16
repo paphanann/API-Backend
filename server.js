@@ -23,6 +23,9 @@ const { ensureSchema } = require("./services/stores/schema");
 const { startTokenRefreshJob } = require("./services/sync/tokenRefreshJob");
 const { startOrderSyncJob } = require("./services/sync/orderSyncJob");
 const { startSapMapJob } = require("./services/marketplaces/sapService");
+const dashboardRoutes = require("./routes/dashboardRoutes");
+const { poolPromise } = require("./config/database");
+const { startTimer } = require("./utils/timing");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -48,6 +51,16 @@ function isAllowedOrigin(origin) {
     return false;
   }
 }
+
+app.use((req, res, next) => {
+  const asksForLocal = String(req.headers["access-control-request-private-network"] || "")
+    .trim()
+    .toLowerCase();
+  if (asksForLocal === "true") {
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
+  }
+  next();
+});
 
 app.use(
   cors({
@@ -78,21 +91,38 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/api/health", (req, res) => {
-  res.json({
+app.get("/api/health", async (req, res) => {
+  const done = startTimer("GET /api/health");
+  const db = startTimer("GET /api/health database");
+  let dbOk = false;
+  try {
+    const pool = await poolPromise;
+    await pool.request().query("SELECT 1 AS ok");
+    dbOk = true;
+  } catch (error) {
+    console.error("Health database check failed:", error.message);
+  }
+  const dbMs = db(dbOk ? "ok" : "error");
+  const totalMs = done();
+  res.status(dbOk ? 200 : 503).json({
     message: "PASS Marketplace Backend",
-    status: "running",
+    status: dbOk ? "running" : "degraded",
+    dbOk,
+    dbMs,
+    totalMs,
   });
 });
 
 app.use("/api/auth", authRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/users", usersRoutes);
+app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/connections", connectionRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/inventory", inventoryRoutes);
 app.use("/api/stocks", inventoryRoutes);
+app.use("/api/warehouses", inventoryRoutes);
 app.use("/api/sync", syncRoutes);
 app.use("/api/tiktok", tiktokRoutes);
 app.use("/api/lazada", lazadaRoutes);

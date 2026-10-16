@@ -31,8 +31,45 @@ function thaiWallToUtcMs(value) {
   );
 }
 
+function windowFromRange(sinceMs, untilMs, incremental) {
+  return {
+    incremental: Boolean(incremental),
+    sinceMs,
+    untilMs,
+    sinceSec: Math.floor(sinceMs / 1000),
+    untilSec: Math.floor(untilMs / 1000),
+    sinceIso: new Date(sinceMs).toISOString(),
+    untilIso: new Date(untilMs).toISOString(),
+    sinceLazada: formatLazadaDate(sinceMs),
+    untilLazada: formatLazadaDate(untilMs),
+  };
+}
+
+function timeChunks(sinceMs, untilMs, chunkMs) {
+  const chunks = [];
+  const step = Math.max(60_000, Number(chunkMs) || 0);
+  let end = untilMs;
+  while (end > sinceMs + 1000) {
+    const start = Math.max(sinceMs, end - step);
+    chunks.push(windowFromRange(start, end, false));
+    if (start <= sinceMs) break;
+    end = start;
+  }
+  return chunks;
+}
+
 function resolveSyncWindow(connection = {}, options = {}) {
   const nowMs = Date.now();
+  if (Number.isFinite(Number(options.sinceMs))) {
+    const sinceMs = Number(options.sinceMs);
+    const untilMs = Number.isFinite(Number(options.untilMs)) ? Number(options.untilMs) : nowMs;
+    return windowFromRange(sinceMs, untilMs, false);
+  }
+  if (options.fullHistory) {
+    const historyMs = Number(options.historyMs || 5 * 365 * 24 * 60 * 60 * 1000);
+    return windowFromRange(nowMs - historyMs, nowMs, false);
+  }
+
   const lookbackMs = Number(options.lookbackMs || DEFAULT_LOOKBACK_MS);
   const maxMs = Number(options.maxMs || DEFAULT_MAX_MS);
   const firstMs = Number(options.firstMs || DEFAULT_FIRST_MS);
@@ -50,18 +87,7 @@ function resolveSyncWindow(connection = {}, options = {}) {
     sinceMs = nowMs - 60_000;
   }
 
-  return {
-    incremental,
-    sinceMs,
-    untilMs: nowMs,
-    sinceSec: Math.floor(sinceMs / 1000),
-    untilSec: Math.floor(nowMs / 1000),
-    sinceIso: new Date(sinceMs).toISOString(),
-    untilIso: new Date(nowMs).toISOString(),
-    // Lazada ต้องเป็น YYYY-MM-DDTHH:mm:ss±HH:MM (มี colon, ไม่มี millis)
-    sinceLazada: formatLazadaDate(sinceMs),
-    untilLazada: formatLazadaDate(nowMs),
-  };
+  return windowFromRange(sinceMs, nowMs, incremental);
 }
 
 /** เช่น 2026-09-17T06:22:57+07:00 */
@@ -79,4 +105,6 @@ function formatLazadaDate(ms) {
 module.exports = {
   resolveSyncWindow,
   thaiWallToUtcMs,
+  timeChunks,
+  windowFromRange,
 };

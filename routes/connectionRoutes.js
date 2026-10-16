@@ -8,7 +8,7 @@ const { ensureSchema } = require("../services/stores/schema");
 const connectionStore = require("../services/stores/connectionStore");
 const shopeeService = require("../services/marketplaces/shopeeService");
 const tiktokService = require("../services/marketplaces/tiktokService");
-const lazadaService = require("../services/marketplaces/lazadaService");
+const { startTimer } = require("../utils/timing");
 
 const services = {
   shopee: shopeeService,
@@ -59,28 +59,17 @@ function handleCallback(slug) {
 }
 
 router.get("/", async (req, res) => {
+  const done = startTimer("GET /api/connections");
   try {
+    const db = startTimer("GET /api/connections database");
     await ensureSchema();
-
-    try {
-      const lazada = await connectionStore.getConnected("Lazada");
-      if (
-        lazada &&
-        (String(lazada.shopName || "").includes("@") ||
-          String(lazada.shopId || "").includes("@") ||
-          !lazada.openId)
-      ) {
-        await lazadaService.refreshShopProfile(lazada);
-      }
-    } catch (error) {
-      console.warn("Lazada profile refresh skipped:", error.message);
-    }
-
     const rows = await connectionStore.listPublicConnections();
+    const dbMs = db(`rows=${rows.length}`);
     console.log(
       `GET /api/connections → ${rows.length} row(s)`,
       rows.map((r) => `${r.Platform}:${r.ShopId || "-"}:${r.Status}`).join(", ") || "(empty)"
     );
+    done(`db=${dbMs}ms`);
     res.json(rows);
   } catch (error) {
     console.error(error);
@@ -130,14 +119,37 @@ router.post("/refresh-tokens", async (req, res) => {
   }
 });
 
+router.post("/:platform/remove", async (req, res) => {
+  try {
+    const platform = normalizePlatform(req.params.platform);
+    const shopId = String(req.body?.shopId || req.query?.shopId || "").trim();
+    const deleted = await connectionStore.deleteShop(platform, shopId || null);
+    if (!deleted) {
+      return res.status(404).json({ message: "ไม่พบร้านค้านี้" });
+    }
+    res.json({
+      success: true,
+      message: "ลบร้านค้าออกจากระบบ PASS แล้ว",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      message: "ไม่สามารถลบร้านค้าได้",
+    });
+  }
+});
+
 router.post("/:platform/disconnect", async (req, res) => {
   try {
     const platform = normalizePlatform(req.params.platform);
-    await connectionStore.disconnectPlatform(platform);
+    const shopId = String(req.body?.shopId || req.query?.shopId || "").trim();
+    await connectionStore.disconnectPlatform(platform, shopId || null);
 
     res.json({
       success: true,
-      message: `ยกเลิกการเชื่อมต่อ ${platform} แล้ว`,
+      message: shopId
+        ? `ยกเลิกการเชื่อมต่อร้าน ${shopId} แล้ว`
+        : `ยกเลิกการเชื่อมต่อ ${platform} แล้ว`,
     });
   } catch (error) {
     console.error(error);

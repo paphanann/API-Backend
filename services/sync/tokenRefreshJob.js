@@ -44,15 +44,16 @@ async function refreshDueConnections() {
         continue;
       }
 
-      let connection;
+      let connections;
       try {
-        connection = await connectionStore.getConnected(platform);
+        connections = await connectionStore.listConnected(platform);
       } catch (error) {
         summary.failed += 1;
         summary.errors.push(`${platform}: ${error.message}`);
         continue;
       }
 
+      for (const connection of connections) {
       if (!connection || !connection.refreshToken) {
         summary.skipped += 1;
         continue;
@@ -63,7 +64,7 @@ async function refreshDueConnections() {
       if (tokenService.needsReconnect(connection)) {
         summary.skipped += 1;
         console.warn(
-          `Token auto-refresh skip ${platform}: refresh token expired, reconnect required`
+          `Token auto-refresh skip ${platform} shop=${connection.shopId || "-"}: refresh token expired, reconnect required`
         );
         continue;
       }
@@ -81,10 +82,11 @@ async function refreshDueConnections() {
         );
       } catch (error) {
         summary.failed += 1;
-        summary.errors.push(`${platform}: ${error.message}`);
+        summary.errors.push(`${platform} ${connection.shopId || ""}: ${error.message}`);
         console.error(
-          `Token auto-refresh failed: ${platform} -> ${error.message}`
+          `Token auto-refresh failed: ${platform} shop=${connection.shopId || "-"} -> ${error.message}`
         );
+      }
       }
     }
   } finally {

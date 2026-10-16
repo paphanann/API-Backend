@@ -144,6 +144,9 @@ async function saveSettings(payload = {}) {
   });
 
   let passwordEncrypted = prev.PasswordEncrypted || null;
+  if (payload.clearPassword === true) {
+    passwordEncrypted = null;
+  }
   const incomingPassword = payload.password || payload.Password;
   if (incomingPassword && String(incomingPassword).trim()) {
     const enc = tryEncrypt(String(incomingPassword).trim());
@@ -178,6 +181,8 @@ async function saveSettings(payload = {}) {
       END
     `);
 
+  const { clearCompanyCache } = require("./companyContext");
+  clearCompanyCache();
   return getSettings();
 }
 

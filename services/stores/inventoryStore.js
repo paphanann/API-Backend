@@ -1,5 +1,6 @@
 const { poolPromise } = require("../../config/database");
 const { ensureSchema } = require("./schema");
+const { currentCompanyId } = require("./companyContext");
 
 function skuKey(row) {
   const sku = String(row.Sku || "").trim();
@@ -13,19 +14,27 @@ async function listInventory(warehouse) {
   await ensureSchema();
   const pool = await poolPromise;
 
-  const result = await pool.request().query(`
+  const result = await pool.request()
+    .input("companyId", await currentCompanyId())
+    .query(`
     SELECT
-      Id,
-      Platform,
-      ProductId,
-      Sku,
-      Name,
-      Price,
-      Stock,
-      Status,
-      SyncedAt
-    FROM dbo.MarketplaceProduct
-    ORDER BY SyncedAt DESC
+      p.Id,
+      p.Platform,
+      p.ProductId,
+      p.Sku,
+      p.Name,
+      p.Price,
+      p.Stock,
+      p.Status,
+      p.SyncedAt
+    FROM dbo.MarketplaceProduct p
+    INNER JOIN dbo.MarketplaceConnection c
+      ON c.Platform = p.Platform
+     AND ISNULL(c.CompanyId, N'') = ISNULL(p.CompanyId, N'')
+     AND ISNULL(c.ShopId, N'') = ISNULL(p.ShopId, N'')
+     AND UPPER(ISNULL(c.ConnectionStatus, N'')) = N'CONNECTED'
+    WHERE ISNULL(p.CompanyId, N'') = ISNULL(@companyId, N'')
+    ORDER BY p.SyncedAt DESC
   `);
 
   const bySku = new Map();

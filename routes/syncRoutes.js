@@ -4,8 +4,8 @@ const router = express.Router();
 const { poolPromise } = require("../config/database");
 const { normalizePlatform } = require("../utils/platform");
 const { publicError } = require("../utils/normalize");
-const syncEngine = require("../services/sync/syncEngine");
-const { syncAllConnected } = require("../services/sync/orderSyncJob");
+const { enqueueSync, getSyncJob } = require("../services/sync/orderSyncJob");
+const { startTimer } = require("../utils/timing");
 
 function cleanLogMessage(value) {
   let text = String(value || "")
@@ -104,61 +104,80 @@ router.get("/logs", async (req, res) => {
   }
 });
 
-router.post("/now", async (req, res) => {
-  try {
-    const force =
-      String(req.query.force || req.body?.force || "").trim() === "1" ||
-      req.body?.force === true;
-    // Sync Now always reloads products (Shopee skips product fetch on incremental otherwise)
-    const forceProducts =
-      force ||
-      String(req.query.forceProducts || req.body?.forceProducts || "1").trim() === "1" ||
-      req.body?.forceProducts === true;
-    const summary = await syncAllConnected({ force, forceProducts });
-    res.json({
-      success: true,
-      message: summary.skipped
-        ? summary.message || "ข้ามเพราะเพิ่ง sync"
-        : "Sync Now เสร็จแล้ว",
-      ...summary,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      success: false,
-      message: publicError(error, "Sync Now ไม่สำเร็จ"),
-    });
+function wantsIncremental(req) {
+  return (
+    String(req.query.incremental || "").trim() === "1" ||
+    req.body?.incremental === true ||
+    String(req.body?.incremental || "").trim() === "1"
+  );
+}
+
+function wantsForce(req) {
+  return (
+    String(req.query.force || "").trim() === "1" ||
+    req.body?.force === true ||
+    String(req.body?.force || "").trim() === "1"
+  );
+}
+
+function wantsForceProducts(req) {
+  if (wantsIncremental(req) && !wantsForce(req)) return false;
+  return (
+    wantsForce(req) ||
+    String(req.query.forceProducts || "").trim() === "1" ||
+    req.body?.forceProducts === true ||
+    String(req.body?.forceProducts || "").trim() === "1"
+  );
+}
+
+router.get("/jobs/:jobId", (req, res) => {
+  const job = getSyncJob(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ message: "ไม่พบงานซิงก์" });
   }
+  res.json(job);
 });
 
-router.post("/all", async (req, res) => {
-  try {
-    const summary = await syncAllConnected();
-    res.json({
-      success: true,
-      message: "ซิงก์ทุกแพลตฟอร์มเสร็จแล้ว",
-      ...summary,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      success: false,
-      message: publicError(error, "ซิงก์ไม่สำเร็จ"),
-    });
-  }
+router.post("/now", (req, res) => {
+  const done = startTimer("POST /api/sync/now");
+  const job = enqueueSync({
+    force: wantsForce(req),
+    forceProducts: wantsForceProducts(req),
+    skipCooldown: true,
+  });
+  done(`job=${job.jobId} ${job.status}`);
+  res.status(202).json({
+    success: true,
+    ...job,
+  });
 });
 
-router.post("/:platform", async (req, res) => {
+router.post("/all", (req, res) => {
+  const job = enqueueSync({
+    force: wantsForce(req),
+    forceProducts: wantsForceProducts(req),
+    skipCooldown: true,
+  });
+  res.status(202).json({
+    success: true,
+    ...job,
+  });
+});
+
+router.post("/:platform", (req, res) => {
   const platform = normalizePlatform(req.params.platform);
 
   try {
-    const forceProducts =
-      String(req.query.forceProducts || req.body?.forceProducts || "").trim() === "1" ||
-      req.body?.forceProducts === true ||
-      String(req.query.force || req.body?.force || "").trim() === "1" ||
-      req.body?.force === true;
-    const result = await syncEngine.syncPlatform(platform, { forceProducts });
-    res.json(result);
+    const job = enqueueSync({
+      platform,
+      force: wantsForce(req),
+      forceProducts: wantsForceProducts(req),
+    });
+    res.status(202).json({
+      success: true,
+      platform,
+      ...job,
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({

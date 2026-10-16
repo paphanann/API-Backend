@@ -1,5 +1,7 @@
 const { poolPromise } = require("../../config/database");
+const { clipText } = require("../../utils/normalize");
 const { ensureSchema } = require("./schema");
+const { currentCompanyId } = require("./companyContext");
 
 function variantsJson(product) {
   const list = Array.isArray(product.variants) ? product.variants : [];
@@ -16,6 +18,12 @@ function parseVariants(raw) {
   }
 }
 
+function shopMatch(alias = "") {
+  const shop = alias ? `${alias}.ShopId` : "ShopId";
+  const company = alias ? `${alias}.CompanyId` : "CompanyId";
+  return `ISNULL(${company}, N'') = ISNULL(@companyId, N'') AND ISNULL(${shop}, N'') = ISNULL(@shopId, N'')`;
+}
+
 async function upsertProduct(product) {
   await ensureSchema();
   const pool = await poolPromise;
@@ -23,12 +31,14 @@ async function upsertProduct(product) {
   await pool
     .request()
     .input("platform", product.platform)
-    .input("productId", String(product.productId))
-    .input("sku", product.sku || null)
-    .input("name", product.name || null)
+    .input("companyId", product.companyId ? String(product.companyId) : await currentCompanyId())
+    .input("shopId", product.shopId ? String(product.shopId) : null)
+    .input("productId", clipText(product.productId, 100))
+    .input("sku", clipText(product.sku, 100))
+    .input("name", clipText(product.name, 255))
     .input("price", product.price)
     .input("stock", product.stock)
-    .input("status", product.status || null)
+    .input("status", clipText(product.status, 50))
     .input("imageUrl", product.imageUrl || null)
     .input("variantsJson", variantsJson(product))
     .query(`
@@ -37,6 +47,7 @@ async function upsertProduct(product) {
         FROM dbo.MarketplaceProduct
         WHERE Platform = @platform
           AND ProductId = @productId
+          AND ${shopMatch()}
       )
       BEGIN
         UPDATE dbo.MarketplaceProduct
@@ -48,15 +59,20 @@ async function upsertProduct(product) {
           Status = @status,
           ImageUrl = COALESCE(@imageUrl, ImageUrl),
           VariantsJson = COALESCE(@variantsJson, VariantsJson),
+          CompanyId = @companyId,
+          ShopId = @shopId,
           SyncedAt = GETDATE()
         WHERE Platform = @platform
           AND ProductId = @productId
+          AND ${shopMatch()}
       END
       ELSE
       BEGIN
         INSERT INTO dbo.MarketplaceProduct
         (
           Platform,
+          CompanyId,
+          ShopId,
           ProductId,
           Sku,
           Name,
@@ -70,6 +86,8 @@ async function upsertProduct(product) {
         VALUES
         (
           @platform,
+          @companyId,
+          @shopId,
           @productId,
           @sku,
           @name,
@@ -84,17 +102,20 @@ async function upsertProduct(product) {
     `);
 }
 
-async function deleteProduct(platform, productId) {
+async function deleteProduct(platform, productId, shopId) {
   await ensureSchema();
   const pool = await poolPromise;
   await pool
     .request()
     .input("platform", platform)
+    .input("companyId", await currentCompanyId())
+    .input("shopId", shopId ? String(shopId) : null)
     .input("productId", String(productId))
     .query(`
       DELETE FROM dbo.MarketplaceProduct
       WHERE Platform = @platform
         AND ProductId = @productId
+        AND ${shopMatch()}
     `);
 }
 
@@ -122,8 +143,9 @@ async function deleteNonActive(platform) {
  * หลัง sync แคตตาล็อกเต็ม: ลบสินค้าของแพลตฟอร์มที่ไม่อยู่ในรายการที่ยังขาย
  * @param {string} platform
  * @param {string[]} keepProductIds
+ * @param {string} shopId
  */
-async function deleteMissing(platform, keepProductIds) {
+async function deleteMissing(platform, keepProductIds, shopId) {
   await ensureSchema();
   const pool = await poolPromise;
   const keep = [...new Set((keepProductIds || []).map((id) => String(id)).filter(Boolean))];
@@ -132,16 +154,22 @@ async function deleteMissing(platform, keepProductIds) {
     const result = await pool
       .request()
       .input("platform", platform)
+      .input("companyId", await currentCompanyId())
+      .input("shopId", shopId ? String(shopId) : null)
       .query(`
-        DELETE FROM dbo.MarketplaceProduct WHERE Platform = @platform;
+        DELETE FROM dbo.MarketplaceProduct
+        WHERE Platform = @platform
+          AND ${shopMatch()};
         SELECT @@ROWCOUNT AS Deleted;
       `);
     return Number(result.recordset && result.recordset[0] && result.recordset[0].Deleted) || 0;
   }
 
-  // สร้างตารางชั่วคราวของ id ที่เก็บไว้ แล้วลบตัวที่ไม่อยู่ในนั้น
   const tvpValues = keep.map((_, i) => `(@id${i})`).join(",");
-  const req = pool.request().input("platform", platform);
+  const req = pool.request()
+    .input("platform", platform)
+    .input("companyId", await currentCompanyId())
+    .input("shopId", shopId ? String(shopId) : null);
   keep.forEach((id, i) => req.input(`id${i}`, id));
 
   const result = await req.query(`
@@ -151,8 +179,11 @@ async function deleteMissing(platform, keepProductIds) {
     DELETE p
     FROM dbo.MarketplaceProduct p
     WHERE p.Platform = @platform
+      AND ${shopMatch("p")}
       AND NOT EXISTS (
-        SELECT 1 FROM @Keep k WHERE k.ProductId = p.ProductId
+        SELECT 1
+        FROM @Keep k
+        WHERE k.ProductId COLLATE DATABASE_DEFAULT = p.ProductId COLLATE DATABASE_DEFAULT
       );
 
     SELECT @@ROWCOUNT AS Deleted;
@@ -161,34 +192,51 @@ async function deleteMissing(platform, keepProductIds) {
   return Number(result.recordset && result.recordset[0] && result.recordset[0].Deleted) || 0;
 }
 
-async function listProducts(platform) {
+async function listProducts(platform, shopId) {
   await ensureSchema();
   const pool = await poolPromise;
   const request = pool.request();
 
   let query = `
     SELECT
-      Id,
-      Platform,
-      ProductId,
-      Sku,
-      Name,
-      Price,
-      Stock,
-      Status,
-      ImageUrl,
-      VariantsJson,
-      SyncedAt,
-      SyncedAt AS UpdatedAt
-    FROM dbo.MarketplaceProduct
+      p.Id,
+      p.Platform,
+      p.CompanyId,
+      p.ShopId,
+      p.ProductId,
+      p.Sku,
+      p.Name,
+      p.Price,
+      p.Stock,
+      p.Status,
+      p.ImageUrl,
+      p.VariantsJson,
+      p.SyncedAt,
+      p.SyncedAt AS UpdatedAt
+    FROM dbo.MarketplaceProduct p
+    INNER JOIN dbo.MarketplaceConnection c
+      ON c.Platform = p.Platform
+     AND ISNULL(c.CompanyId, N'') = ISNULL(p.CompanyId, N'')
+     AND ISNULL(c.ShopId, N'') = ISNULL(p.ShopId, N'')
+     AND UPPER(ISNULL(c.ConnectionStatus, N'')) = N'CONNECTED'
   `;
 
+  const companyId = await currentCompanyId();
+  request.input("companyId", companyId);
+  const filters = ["ISNULL(p.CompanyId, N'') = ISNULL(@companyId, N'')"];
   if (platform) {
     request.input("platform", platform);
-    query += " WHERE Platform = @platform";
+    filters.push("p.Platform = @platform");
+  }
+  if (shopId) {
+    request.input("shopId", String(shopId));
+    filters.push("ISNULL(p.ShopId, N'') = ISNULL(@shopId, N'')");
+  }
+  if (filters.length) {
+    query += ` WHERE ${filters.join(" AND ")}`;
   }
 
-  query += " ORDER BY SyncedAt DESC";
+  query += " ORDER BY p.SyncedAt DESC";
   const result = await request.query(query);
   return result.recordset.map((row) => {
     const variants = parseVariants(row.VariantsJson);
@@ -201,12 +249,14 @@ async function listProducts(platform) {
   });
 }
 
-async function saveVariantMap(platform, productId, variants) {
+async function saveVariantMap(platform, productId, variants, shopId) {
   await ensureSchema();
   const pool = await poolPromise;
   await pool
     .request()
     .input("platform", platform)
+    .input("companyId", await currentCompanyId())
+    .input("shopId", shopId ? String(shopId) : null)
     .input("productId", String(productId))
     .input("variantsJson", JSON.stringify(variants || []))
     .query(`
@@ -214,7 +264,23 @@ async function saveVariantMap(platform, productId, variants) {
       SET VariantsJson = @variantsJson
       WHERE Platform = @platform
         AND ProductId = @productId
+        AND ${shopMatch()}
     `);
+}
+
+function sapCodeIndex(products) {
+  const map = new Map();
+  for (const row of products || []) {
+    for (const variant of row.variants || []) {
+      const sku = String(variant.sku || "").trim();
+      if (!sku || !variant.sapItemCode) continue;
+      const code = String(variant.sapItemCode);
+      const list = map.get(sku) || [];
+      if (!list.includes(code)) list.push(code);
+      map.set(sku, list);
+    }
+  }
+  return map;
 }
 
 async function sapCodesForSku(platform, sku) {
@@ -237,5 +303,6 @@ module.exports = {
   deleteMissing,
   listProducts,
   saveVariantMap,
+  sapCodeIndex,
   sapCodesForSku,
 };

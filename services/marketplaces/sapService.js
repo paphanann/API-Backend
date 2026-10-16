@@ -215,7 +215,7 @@ async function listMasterItems() {
 
   const http = client();
   const items = [];
-  let path = "/Items?$select=ItemCode,ItemName,ForeignName,InventoryItem,U_Itemcode_api&$orderby=ItemCode";
+  let path = "/Items?$select=ItemCode,ItemName,ForeignName,InventoryItem,QuantityOnStock,InventoryUOM,U_Itemcode_api&$orderby=ItemCode";
 
   while (path && items.length < 5000) {
     const { data } = await http.get(path, {
@@ -233,6 +233,18 @@ async function listMasterItems() {
 
   masterCache = { at: Date.now(), items };
   return items;
+}
+
+async function listStockItems() {
+  const items = await listMasterItems();
+  return items
+    .filter((item) => String(item.ItemCode || "").trim() && isInventoryItem(item))
+    .map((item) => ({
+      sku: String(item.ItemCode).trim(),
+      name: String(item.ItemName || "").trim(),
+      stock: Math.round(Number(item.QuantityOnStock) || 0),
+      unit: String(item.InventoryUOM || "").trim() || "ชิ้น",
+    }));
 }
 
 function buildMasterIndex(items) {
@@ -421,7 +433,7 @@ async function mapStoredProducts(platform) {
       variants: row.variants || [],
     };
     const next = await mapProduct(product);
-    await productStore.saveVariantMap(product.platform, product.productId, next.variants);
+    await productStore.saveVariantMap(product.platform, product.productId, next.variants, row.ShopId);
     mapped += next.variants.filter((variant) => variant.sapItemCode).length;
   }
   return mapped;
@@ -535,5 +547,6 @@ module.exports = {
   mapStoredProducts,
   startSapMapJob,
   clearMasterCache,
+  listStockItems,
   createSalesOrder,
 };

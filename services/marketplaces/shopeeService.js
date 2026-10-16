@@ -3,6 +3,8 @@ const axios = require("axios");
 
 const connectionStore = require("../stores/connectionStore");
 const tokenService = require("../tokenService");
+const { marketplaceTimeoutMs } = require("../../utils/httpTimeout");
+const { mapPool } = require("../../utils/mapPool");
 const {
   expiryDate,
   toDate,
@@ -101,7 +103,7 @@ async function shopeeRequest(method, path, { body, query, connection } = {}) {
       url,
       params: query,
       data: method === "GET" ? undefined : body,
-      timeout: 30000,
+      timeout: marketplaceTimeoutMs(),
     });
 
     if (data && data.error) {
@@ -159,6 +161,86 @@ async function saveShopConnection(fields) {
   });
 }
 
+function unwrapShopeeToken(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  if (payload.access_token) return payload;
+  if (payload.data && payload.data.access_token) return payload.data;
+  if (payload.response && payload.response.access_token) return payload.response;
+  return null;
+}
+
+function collectShopIds(body) {
+  const ids = [];
+  const push = (value) => {
+    const id = text(value);
+    if (!id || id === "0" || ids.includes(id)) return;
+    ids.push(id);
+  };
+
+  if (Array.isArray(body.shop_id_list)) {
+    body.shop_id_list.forEach(push);
+  }
+  push(body.shop_id);
+  push(body.shopId);
+  if (!ids.length) {
+    push(body.main_account_id || body.mainAccountId);
+  }
+  return ids;
+}
+
+function shopNameFrom(shop) {
+  if (!shop || typeof shop !== "object") return null;
+  const response = shop.response && typeof shop.response === "object" ? shop.response : null;
+  return (
+    shop.shop_name ||
+    (response && response.shop_name) ||
+    (shop.shop_info && shop.shop_info.shop_name) ||
+    null
+  );
+}
+
+async function importTokenPayload(payload) {
+  const body = unwrapShopeeToken(payload);
+  if (!body || !body.access_token || !body.refresh_token) {
+    throw new Error("ไฟล์โทเค็น Shopee ไม่ครบ access_token หรือ refresh_token");
+  }
+
+  const shopIds = collectShopIds(body);
+  if (!shopIds.length) {
+    throw new Error("ไฟล์โทเค็น Shopee ไม่มี shop_id");
+  }
+
+  const saved = [];
+  for (const shopId of shopIds) {
+    let shopName = null;
+    try {
+      const shop = await getShopInfo(shopId, body.access_token);
+      shopName = shopNameFrom(shop);
+    } catch (error) {
+      console.warn(`Shopee getShopInfo failed shop=${shopId}: ${error.message || error}`);
+    }
+
+    await saveShopConnection({
+      shopId,
+      shopName,
+      sellerId: text(body.merchant_id || body.main_account_id) || null,
+      accessToken: body.access_token,
+      refreshToken: body.refresh_token,
+      accessTokenExpireAt: expiryDate(body.expire_in || body.expireAt || body.access_token_expire_in),
+      refreshTokenExpireAt: expiryDate(body.refresh_token_expire_in),
+    });
+
+    console.log(`Shopee shop saved shop=${shopId} name=${shopName || "-"}`);
+    saved.push({
+      shopId,
+      shopName,
+      sellerId: text(body.merchant_id || body.main_account_id) || shopId,
+    });
+  }
+
+  return { ...saved[0], shops: saved };
+}
+
 async function completeOAuth(query) {
   const code = text(query.code);
   const shopId = text(query.shop_id || query.shopId);
@@ -189,33 +271,11 @@ async function completeOAuth(query) {
     throw new Error("แลก token จาก Shopee ไม่สำเร็จ");
   }
 
-  const resolvedShopId = text(
-    shopId ||
-      (tokens.shop_id_list && tokens.shop_id_list[0]) ||
-      tokens.shop_id ||
-      mainAccountId,
-    "shopee"
-  );
-
-  let shopName = null;
-  try {
-    const shop = await getShopInfo(resolvedShopId, tokens.access_token);
-    shopName = shop && (shop.shop_name || (shop.shop_info && shop.shop_info.shop_name));
-  } catch {
-    shopName = null;
-  }
-
-  await saveShopConnection({
-    shopId: resolvedShopId,
-    shopName,
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token,
-    accessTokenExpireAt: expiryDate(tokens.expire_in || tokens.expireAt),
-    refreshTokenExpireAt: expiryDate(tokens.refresh_token_expire_in),
+  return importTokenPayload({
+    ...tokens,
+    shop_id: shopId || tokens.shop_id,
+    main_account_id: mainAccountId || tokens.main_account_id,
   });
-
-  console.log(`Shopee saved MarketplaceConnection shop=${resolvedShopId} name=${shopName || "-"}`);
-  return { shopId: resolvedShopId, shopName };
 }
 
 async function ensureFreshTokens(connection, options = {}) {
@@ -478,21 +538,15 @@ function normalizeProduct(item, modelsPayload = null) {
   };
 }
 
-const { resolveSyncWindow } = require("../../utils/syncWindow");
+const { resolveSyncWindow, timeChunks } = require("../../utils/syncWindow");
 
-async function fetchOrders(connection, options = {}) {
-  const window = resolveSyncWindow(connection, {
-    maxMs: 14 * 24 * 60 * 60 * 1000,
-    firstMs: 14 * 24 * 60 * 60 * 1000,
-    ...options.window,
-  });
-
-  // รอบถัดไปใช้ update_time เพื่อจับออเดอร์ที่สถานะเปลี่ยน (ไม่ใช่แค่สร้างใหม่)
+async function fetchShopeeOrdersInWindow(connection, window, options = {}) {
   const timeField = window.incremental ? "update_time" : "create_time";
   const orderSns = [];
   let cursor = "";
+  let capped = true;
 
-  for (let page = 0; page < 10; page += 1) {
+  for (let page = 0; page < 500; page += 1) {
     const query = {
       time_range_field: timeField,
       time_from: window.sinceSec,
@@ -516,13 +570,19 @@ async function fetchOrders(connection, options = {}) {
     }
 
     if (!data.response || !data.response.more) {
+      capped = false;
       break;
     }
 
     cursor = data.response.next_cursor || "";
     if (!cursor) {
+      capped = false;
       break;
     }
+  }
+
+  if (capped) {
+    console.warn(`Shopee orders hit page cap shop=${connection.shopId || "-"} kept=${orderSns.length}`);
   }
 
   const orders = [];
@@ -539,12 +599,43 @@ async function fetchOrders(connection, options = {}) {
     });
 
     const list = (detail.response && detail.response.order_list) || [];
-    await attachShopeeBuyerShipping(connection, list);
-    for (const row of list) {
-      orders.push(await fillShopeeRecipient(connection, row));
+    if (!options.skipDetails) {
+      await attachShopeeBuyerShipping(connection, list);
     }
+    const filled = options.skipDetails
+      ? list.map((row) => normalizeOrder(row))
+      : await mapPool(list, 4, (row) => fillShopeeRecipient(connection, row));
+    orders.push(...filled);
   }
 
+  return orders;
+}
+
+async function fetchOrders(connection, options = {}) {
+  const window = resolveSyncWindow(connection, {
+    maxMs: 14 * 24 * 60 * 60 * 1000,
+    firstMs: 14 * 24 * 60 * 60 * 1000,
+    ...options.window,
+  });
+  const ranges = window.incremental
+    ? [window]
+    : timeChunks(window.sinceMs, window.untilMs, 14 * 24 * 60 * 60 * 1000);
+
+  const seen = new Set();
+  const orders = [];
+  for (const range of ranges) {
+    const page = await fetchShopeeOrdersInWindow(connection, range, options);
+    console.log(`Shopee orders ${new Date(range.sinceMs).toISOString().slice(0, 10)} ${page.length}`);
+    if (typeof options.onChunk === "function") {
+      await options.onChunk(page);
+    }
+    for (const order of page) {
+      const id = order && order.marketplaceOrderId;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      orders.push(order);
+    }
+  }
   return orders;
 }
 
@@ -560,7 +651,7 @@ async function fetchProducts(connection, options = {}) {
   const products = [];
   let offset = 0;
 
-  for (let page = 0; page < 10; page += 1) {
+  for (let page = 0; page < 200; page += 1) {
     const data = await shopeeRequest("GET", "/api/v2/product/get_item_list", {
       connection,
       query: {
@@ -601,6 +692,7 @@ async function fetchProducts(connection, options = {}) {
     }
 
     offset = data.response.next_offset || offset + 50;
+    if (page === 199) console.warn("Shopee products hit page cap");
   }
 
   return products;
@@ -622,6 +714,7 @@ module.exports = {
   getShopInfo,
   saveShopConnection,
   completeOAuth,
+  importTokenPayload,
   ensureFreshTokens,
   fetchOrders,
   fetchProducts,

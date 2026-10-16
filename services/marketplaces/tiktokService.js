@@ -3,6 +3,7 @@ const axios = require("axios");
 
 const connectionStore = require("../stores/connectionStore");
 const tokenService = require("../tokenService");
+const { marketplaceTimeoutMs } = require("../../utils/httpTimeout");
 const {
   expiryDate,
   toDate,
@@ -10,6 +11,7 @@ const {
   splitOrderAmounts,
   text,
   visibleText,
+  clipText,
   mapOrderStatus,
   mapProductStatus,
 } = require("../../utils/normalize");
@@ -116,7 +118,7 @@ async function tiktokRequest(method, path, { accessToken, shopCipher, query = {}
         "Content-Type": "application/json",
         "x-tts-access-token": accessToken,
       },
-      timeout: 30000,
+      timeout: marketplaceTimeoutMs(),
     });
 
     if (data && Number(data.code) !== 0) {
@@ -150,7 +152,7 @@ async function exchangeCodeForToken(code) {
   try {
     const response = await axios.get(`${tokenHost}/api/v2/token/get`, {
       params,
-      timeout: 30000,
+      timeout: marketplaceTimeoutMs(),
     });
     data = response.data;
   } catch (error) {
@@ -180,7 +182,7 @@ async function refreshAccessToken(refreshToken) {
       refresh_token: refreshToken,
       grant_type: "refresh_token",
     },
-    timeout: 30000,
+    timeout: marketplaceTimeoutMs(),
   });
 
   if (data && Number(data.code) !== 0) {
@@ -205,24 +207,21 @@ async function saveShopConnection(fields) {
   });
 }
 
-async function completeOAuth(query) {
-  const code = text(query.code || query.auth_code);
-
-  if (!code) {
-    throw new Error("TikTok ไม่ได้ส่งรหัสอนุญาตกลับมา");
-  }
-
-  let tokens;
-  try {
-    tokens = await exchangeCodeForToken(code);
-  } catch (error) {
-    throw new Error(
-      `แลก token จาก TikTok ไม่สำเร็จ: ${error.message || error}. ตรวจ Redirect URL ใน Partner Center ว่าตรงกับ TIKTOK_REDIRECT_URL ใน .env`
+function pickAuthorizedShop(shops, tokens) {
+  const want = text(tokens.seller_name || tokens.shop_name).toLowerCase();
+  if (want) {
+    const named = shops.find(
+      (shop) => text(shop.name || shop.shop_name).toLowerCase() === want
     );
+    if (named) return named;
   }
+  return shops[0] || null;
+}
 
-  if (!tokens || !tokens.access_token) {
-    throw new Error("แลก token จาก TikTok ไม่สำเร็จ (ไม่มี access_token)");
+async function importTokenPayload(payload) {
+  const tokens = payload && (payload.access_token ? payload : payload.data);
+  if (!tokens || !tokens.access_token || !tokens.refresh_token) {
+    throw new Error("ไฟล์โทเค็น TikTok ไม่ครบ access_token หรือ refresh_token");
   }
 
   let shopId = text(tokens.seller_id || tokens.open_id || tokens.shop_id, "tiktok");
@@ -232,10 +231,11 @@ async function completeOAuth(query) {
 
   try {
     const shops = await getAuthorizedShops(tokens.access_token);
-    if (shops[0]) {
-      shopId = text(shops[0].id || shops[0].shop_id, shopId);
-      shopName = text(shops[0].name || shops[0].shop_name, shopName);
-      shopCipher = text(shops[0].cipher, shopCipher);
+    const shop = pickAuthorizedShop(shops, tokens);
+    if (shop) {
+      shopId = text(shop.id || shop.shop_id, shopId);
+      shopName = text(shop.name || shop.shop_name, shopName);
+      shopCipher = text(shop.cipher, shopCipher);
     } else {
       shopsError = "ไม่พบร้านใน authorization/shops";
     }
@@ -256,20 +256,46 @@ async function completeOAuth(query) {
   });
 
   console.log(
-    `TikTok OAuth saved shop=${shopId} cipher=${shopCipher ? "yes" : "NO"} shopsError=${shopsError || "-"}`
+    `TikTok shop saved shop=${shopId} name=${shopName || "-"} cipher=${shopCipher ? "yes" : "NO"} shopsError=${shopsError || "-"}`
   );
 
   if (!shopCipher) {
-    // บันทึก token แล้ว แต่ยัง sync ไม่ได้จนกว่าจะได้ cipher
     const err = new Error(
-      "เชื่อมต่อแล้วแต่ยังไม่มี shop_cipher — เปิด scope authorization.shop (และสิทธิ์ร้าน) ใน TikTok Partner Center แล้วกดเชื่อมต่อใหม่"
+      "บันทึกร้านแล้วแต่ยังไม่มี shop_cipher — เปิด scope authorization.shop ใน TikTok Partner Center แล้วเชื่อมต่อใหม่"
     );
     err.code = "MISSING_SHOP_CIPHER";
     err.partialSuccess = true;
     throw err;
   }
 
-  return { shopId, shopName };
+  return {
+    shopId,
+    shopName,
+    sellerId: text(tokens.open_id) || shopId,
+  };
+}
+
+async function completeOAuth(query) {
+  const code = text(query.code || query.auth_code);
+
+  if (!code) {
+    throw new Error("TikTok ไม่ได้ส่งรหัสอนุญาตกลับมา");
+  }
+
+  let tokens;
+  try {
+    tokens = await exchangeCodeForToken(code);
+  } catch (error) {
+    throw new Error(
+      `แลก token จาก TikTok ไม่สำเร็จ: ${error.message || error}. ตรวจ Redirect URL ใน Partner Center ว่าตรงกับ TIKTOK_REDIRECT_URL ใน .env`
+    );
+  }
+
+  if (!tokens || !tokens.access_token) {
+    throw new Error("แลก token จาก TikTok ไม่สำเร็จ (ไม่มี access_token)");
+  }
+
+  return importTokenPayload(tokens);
 }
 
 async function ensureShopCipher(connection) {
@@ -296,6 +322,7 @@ async function ensureShopCipher(connection) {
   }
 
   await connectionStore.updateConnectedShop("TikTok", {
+    fromShopId: connection.shopId,
     shopId,
     shopName,
     shopCipher,
@@ -357,7 +384,7 @@ function recipientAddress(order) {
   const districts = Array.isArray(recipient.district_info)
     ? recipient.district_info.map((part) => part && part.address_name)
     : [];
-  return [
+  const joined = [
     recipient.full_address,
     recipient.address_detail,
     recipient.address_line1,
@@ -373,6 +400,7 @@ function recipientAddress(order) {
     .map((part) => visibleText(part))
     .filter((part, index, all) => part && all.indexOf(part) === index)
     .join(" ");
+  return clipText(joined, 500);
 }
 
 function normalizeOrder(order) {
@@ -491,7 +519,7 @@ function normalizeProduct(product) {
   };
 }
 
-const { resolveSyncWindow } = require("../../utils/syncWindow");
+const { resolveSyncWindow, timeChunks } = require("../../utils/syncWindow");
 
 async function fillTiktokRecipients(connection, orders) {
   const missing = orders.filter((order) => {
@@ -525,17 +553,11 @@ async function fillTiktokRecipients(connection, orders) {
   return orders.map((order) => byId.get(String(order.id || order.order_id)) || order);
 }
 
-async function fetchOrders(connection, options = {}) {
-  const window = resolveSyncWindow(connection, {
-    maxMs: 7 * 24 * 60 * 60 * 1000,
-    firstMs: 7 * 24 * 60 * 60 * 1000,
-    ...options.window,
-  });
-
+async function fetchTikTokOrdersInWindow(connection, window) {
   const orders = [];
   let pageToken = "";
 
-  for (let page = 0; page < 10; page += 1) {
+  for (let page = 0; page < 500; page += 1) {
     const query = { page_size: 50 };
     if (pageToken) {
       query.page_token = pageToken;
@@ -570,6 +592,38 @@ async function fetchOrders(connection, options = {}) {
     }
   }
 
+  if (pageToken) {
+    console.warn(`TikTok orders hit page cap shop=${connection.shopId || "-"} kept=${orders.length}`);
+  }
+
+  return orders;
+}
+
+async function fetchOrders(connection, options = {}) {
+  const window = resolveSyncWindow(connection, {
+    maxMs: 7 * 24 * 60 * 60 * 1000,
+    firstMs: 7 * 24 * 60 * 60 * 1000,
+    ...options.window,
+  });
+  const ranges = window.incremental
+    ? [window]
+    : timeChunks(window.sinceMs, window.untilMs, 7 * 24 * 60 * 60 * 1000);
+
+  const seen = new Set();
+  const orders = [];
+  for (const range of ranges) {
+    const page = await fetchTikTokOrdersInWindow(connection, range);
+    console.log(`TikTok orders ${new Date(range.sinceMs).toISOString().slice(0, 10)} ${page.length}`);
+    if (typeof options.onChunk === "function") {
+      await options.onChunk(page);
+    }
+    for (const order of page) {
+      const id = order && order.marketplaceOrderId;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      orders.push(order);
+    }
+  }
   return orders;
 }
 
@@ -663,6 +717,7 @@ module.exports = {
   exchangeCodeForToken,
   saveShopConnection,
   completeOAuth,
+  importTokenPayload,
   ensureFreshTokens,
   fetchOrders,
   fetchProducts,

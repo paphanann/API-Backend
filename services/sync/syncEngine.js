@@ -9,6 +9,7 @@ const lazadaService = require("../marketplaces/lazadaService");
 const tokenService = require("../tokenService");
 const { resolveSyncWindow } = require("../../utils/syncWindow");
 const { publicError } = require("../../utils/normalize");
+const { startTimer } = require("../../utils/timing");
 
 const services = {
   Shopee: shopeeService,
@@ -34,6 +35,9 @@ async function pushToSap(order) {
 
 function shouldCreateSalesOrder(order, result) {
   if (result && result.sapDocNum) {
+    return false;
+  }
+  if (result && String(result.syncStatus || "").toLowerCase() === "history") {
     return false;
   }
   return String(order.orderStatus || "").toLowerCase() !== "cancelled";
@@ -97,17 +101,27 @@ function resolveRunStatus({ sapError, inserted, updated, productCount, sapOk }) 
   return "success";
 }
 
-async function syncPlatform(platform, options = {}) {
+function shopCanSync(connection) {
+  if (!connection || !connection.shopId || !connection.accessToken) return false;
+  if (tokenService.needsReconnect(connection)) return false;
+  return true;
+}
+
+async function syncConnectedShop(platform, connection, options = {}) {
   const service = services[platform];
 
   if (!service) {
     throw new Error(`ยังไม่รองรับแพลตฟอร์ม ${platform}`);
   }
 
-  const connection = await connectionStore.getConnected(platform);
+  if (!shopCanSync(connection)) {
+    throw new Error("ร้านนี้ไม่ได้เชื่อมต่อ หรือโทเค็นหมดอายุ ต้องเชื่อมต่อใหม่ก่อนซิงค์");
+  }
 
-  if (!connection) {
-    throw new Error("ยังไม่ได้เชื่อมต่อร้านค้า");
+  if (platform === "TikTok" && !connection.shopCipher) {
+    throw new Error(
+      `ร้าน ${connection.shopName || connection.shopId || ""} ยังไม่มี shop_cipher — ต้องเปิด scope แล้ว Connect ใหม่`
+    );
   }
 
   const window = resolveSyncWindow(connection, options.window);
@@ -143,15 +157,42 @@ async function syncPlatform(platform, options = {}) {
         let nextUpdated = 0;
         let nextUnchanged = 0;
 
+        const fetchOrdersDone = startTimer(`${platform} marketplace orders`);
         const orders = await service.fetchOrders(fresh, { window: options.window });
+        fetchOrdersDone(`count=${orders.length}`);
 
+        const shopId = connection.shopId ? String(connection.shopId) : null;
+        const companyId = connection.companyId ? String(connection.companyId) : null;
+        const visibleFromMs = Date.parse("2026-10-01T00:00:00.000Z");
+        const visibleOrders = [];
         for (const order of orders) {
-          if (!order.marketplaceOrderId) {
+          if (!order) continue;
+          const orderMs = order.orderDate ? new Date(order.orderDate).getTime() : NaN;
+          if (Number.isFinite(orderMs) && orderMs < visibleFromMs) continue;
+          order.shopId = shopId;
+          order.shopName = connection.shopName ? String(connection.shopName) : order.shopName || null;
+          order.companyId = companyId;
+          visibleOrders.push(order);
+        }
+
+        const dbDone = startTimer(`${platform} database orders`);
+        const saved = await orderStore.upsertOrders(visibleOrders);
+        dbDone(`count=${saved.length}`);
+
+        let sapIndex = null;
+        if (sapService.isConfigured()) {
+          const catalogDone = startTimer(`${platform} sap catalog`);
+          sapIndex = productStore.sapCodeIndex(await productStore.listProducts(platform, shopId));
+          catalogDone();
+        }
+
+        for (let index = 0; index < visibleOrders.length; index += 1) {
+          const order = visibleOrders[index];
+          const result = saved[index];
+          if (!order.marketplaceOrderId || !result) {
             continue;
           }
 
-          order.shopId = connection.shopId ? String(connection.shopId) : null;
-          const result = await orderStore.upsertOrder(order);
           nextOrderCount += 1;
 
           if (result.change === "inserted") {
@@ -167,16 +208,14 @@ async function syncPlatform(platform, options = {}) {
             continue;
           }
 
-          order.lines = await Promise.all(
-            (order.lines || []).map(async (line) => {
-              const codes = await productStore.sapCodesForSku(order.platform, line.sku);
-              return {
-                ...line,
-                sapItemCode: codes.length === 1 ? codes[0] : null,
-                sapAmbiguous: codes.length > 1,
-              };
-            })
-          );
+          order.lines = (order.lines || []).map((line) => {
+            const codes = (sapIndex && sapIndex.get(String(line.sku || "").trim())) || [];
+            return {
+              ...line,
+              sapItemCode: codes.length === 1 ? codes[0] : null,
+              sapAmbiguous: codes.length > 1,
+            };
+          });
 
           const sap = await pushToSap(order);
           if (sap.status === "ok") {
@@ -196,19 +235,23 @@ async function syncPlatform(platform, options = {}) {
           }
         }
 
+        const fetchProductsDone = startTimer(`${platform} marketplace products`);
         const products = await service.fetchProducts(fresh, {
           window: options.window,
           forceProducts: Boolean(options.forceProducts),
         });
+        fetchProductsDone(`count=${products.length}`);
         const keptIds = [];
         for (const product of products) {
           if (!product.productId) {
             continue;
           }
+          product.shopId = shopId;
+          product.companyId = companyId;
 
           const st = String(product.status || "").toLowerCase();
           if (st && st !== "active" && st !== "normal" && st !== "activate") {
-            await productStore.deleteProduct(product.platform, product.productId);
+            await productStore.deleteProduct(product.platform, product.productId, shopId);
             continue;
           }
 
@@ -217,8 +260,8 @@ async function syncPlatform(platform, options = {}) {
           nextProductCount += 1;
         }
 
-        if (options.forceProducts) {
-          await productStore.deleteMissing(platform, keptIds);
+        if (options.forceProducts && shopId) {
+          await productStore.deleteMissing(platform, keptIds, shopId);
         }
 
         if (sapService.isConfigured()) {
@@ -291,6 +334,8 @@ async function syncPlatform(platform, options = {}) {
     return {
       success: status !== "error",
       platform,
+      shopId: connection.shopId,
+      shopName: connection.shopName,
       syncRunId,
       incremental: window.incremental,
       noop: pureNoop || allUnchanged,
@@ -318,6 +363,65 @@ async function syncPlatform(platform, options = {}) {
 
     throw error;
   }
+}
+
+async function syncPlatform(platform, options = {}) {
+  if (options.connection) {
+    return syncConnectedShop(platform, options.connection, options);
+  }
+
+  const shops = (await connectionStore.listConnected(platform)).filter(shopCanSync);
+  if (!shops.length) {
+    throw new Error("ยังไม่ได้เชื่อมต่อร้านค้า");
+  }
+  if (shops.length === 1) {
+    return syncConnectedShop(platform, shops[0], options);
+  }
+
+  const results = [];
+  for (const connection of shops) {
+    try {
+      results.push(
+        await syncConnectedShop(platform, connection, {
+          ...options,
+          keepOtherShops: true,
+        })
+      );
+    } catch (error) {
+      results.push({
+        success: false,
+        platform,
+        shopId: connection.shopId,
+        shopName: connection.shopName,
+        orderCount: 0,
+        productCount: 0,
+        sapOk: 0,
+        sapError: 0,
+        inserted: 0,
+        updated: 0,
+        unchanged: 0,
+        message: publicError(error, "ซิงก์ไม่สำเร็จ"),
+      });
+    }
+  }
+
+  const sum = (key) => results.reduce((total, row) => total + Number(row[key] || 0), 0);
+  const failed = results.filter((row) => !row.success);
+  return {
+    success: failed.length < results.length,
+    platform,
+    shops: results.length,
+    orderCount: sum("orderCount"),
+    productCount: sum("productCount"),
+    sapOk: sum("sapOk"),
+    sapError: sum("sapError"),
+    inserted: sum("inserted"),
+    updated: sum("updated"),
+    unchanged: sum("unchanged"),
+    message: results
+      .map((row) => `${row.shopName || row.shopId || platform}: ${row.message || "ซิงก์สำเร็จ"}`)
+      .join(" | "),
+  };
 }
 
 module.exports = {

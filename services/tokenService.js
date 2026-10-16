@@ -1,6 +1,7 @@
 const { poolPromise, sql } = require("../config/database");
 const { encrypt, decrypt } = require("../utils/tokenCrypto");
 const { ensureSchema } = require("./stores/schema");
+const { currentCompanyId } = require("./stores/companyContext");
 const { isPlausibleTokenExpiry } = require("../utils/normalize");
 
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
@@ -112,6 +113,7 @@ async function applyRefresh(connection, payload) {
 
   await saveTokens({
     platform: next.platform,
+    companyId: next.companyId,
     shopId: next.shopId,
     accessToken: next.accessToken,
     refreshToken: next.refreshToken,
@@ -172,6 +174,7 @@ function shopKey(platform, shopId) {
 
 async function saveTokens({
   platform,
+  companyId,
   shopId,
   accessToken,
   refreshToken,
@@ -187,12 +190,14 @@ async function saveTokens({
   await ensureSchema();
 
   const key = shopKey(platform, shopId);
+  const company = companyId ? String(companyId) : await currentCompanyId();
   const pool = await poolPromise;
   const sealedAccess = encryptToken(accessToken);
   const sealedRefresh = refreshToken ? encryptToken(refreshToken) : null;
 
   const updated = await pool
     .request()
+    .input("companyId", sql.NVarChar(100), company)
     .input("platform", sql.NVarChar(50), key.platform)
     .input("shopId", sql.NVarChar(100), key.shopId)
     .input("accessToken", sql.NVarChar(sql.MAX), sealedAccess)
@@ -207,17 +212,18 @@ async function saveTokens({
         SELECT TOP 1 ConnectionId
         FROM dbo.MarketplaceConnection
         WHERE Platform = @platform
+          AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
+          AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
         ORDER BY UpdatedAt DESC, ConnectionId DESC
       );
 
       IF @id IS NULL
       BEGIN
-        RAISERROR(N'ไม่พบแถว MarketplaceConnection สำหรับแพลตฟอร์มนี้', 16, 1);
+        RAISERROR(N'ไม่พบแถว MarketplaceConnection สำหรับร้านนี้', 16, 1);
       END
 
       UPDATE dbo.MarketplaceConnection
       SET
-        ShopId = @shopId,
         AccessToken = @accessToken,
         RefreshToken = COALESCE(@refreshToken, RefreshToken),
         AccessTokenExpiresAt = @accessExpire,
@@ -227,17 +233,15 @@ async function saveTokens({
         LastRefreshAt = CASE WHEN @markRefreshed = 1 THEN GETDATE() ELSE LastRefreshAt END,
         UpdatedAt = GETDATE()
       WHERE ConnectionId = @id;
-
-      DELETE FROM dbo.MarketplaceConnection
-      WHERE Platform = @platform
-        AND ConnectionId <> @id;
     `);
 
   const rowsUpdated = Number((updated.rowsAffected && updated.rowsAffected[0]) || 0);
 
   const verifyResult = await pool
     .request()
+    .input("companyId", sql.NVarChar(100), company)
     .input("platform", sql.NVarChar(50), key.platform)
+    .input("shopId", sql.NVarChar(100), key.shopId)
     .query(`
       SELECT TOP 1
         CASE WHEN AccessToken IS NOT NULL AND LEN(AccessToken) > 0 THEN 1 ELSE 0 END AS HasAccessToken,
@@ -245,6 +249,8 @@ async function saveTokens({
         AccessTokenExpiresAt
       FROM dbo.MarketplaceConnection
       WHERE Platform = @platform
+        AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
+        AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
       ORDER BY UpdatedAt DESC
     `);
 
@@ -267,14 +273,19 @@ async function saveTokens({
 async function loadTokens(platform, shopId) {
   await ensureSchema();
 
+  if (!shopId) {
+    return null;
+  }
+
   const key = shopKey(platform, shopId);
+  const company = await currentCompanyId();
   const pool = await poolPromise;
   const request = pool
     .request()
+    .input("companyId", sql.NVarChar(100), company)
     .input("platform", sql.NVarChar(50), key.platform);
 
-  const result = shopId
-    ? await request.input("shopId", sql.NVarChar(100), key.shopId).query(`
+  const result = await request.input("shopId", sql.NVarChar(100), key.shopId).query(`
         SELECT TOP 1
           AccessToken,
           RefreshToken,
@@ -283,19 +294,8 @@ async function loadTokens(platform, shopId) {
           ShopCipher
         FROM dbo.MarketplaceConnection
         WHERE Platform = @platform
+          AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
           AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
-        ORDER BY UpdatedAt DESC
-      `)
-    : await request.query(`
-        SELECT TOP 1
-          AccessToken,
-          RefreshToken,
-          AccessTokenExpiresAt,
-          RefreshTokenExpiresAt,
-          ShopCipher
-        FROM dbo.MarketplaceConnection
-        WHERE Platform = @platform
-          AND UPPER(ConnectionStatus) = N'CONNECTED'
         ORDER BY UpdatedAt DESC
       `);
 
@@ -313,33 +313,36 @@ async function loadTokens(platform, shopId) {
   };
 }
 
-async function clearTokens(platform) {
+async function clearTokens(platform, shopId) {
   await ensureSchema();
   const pool = await poolPromise;
-
-  await pool
+  const request = pool
     .request()
-    .input("platform", sql.NVarChar(50), String(platform || "").trim())
-    .query(`
+    .input("companyId", sql.NVarChar(100), await currentCompanyId())
+    .input("platform", sql.NVarChar(50), String(platform || "").trim());
+
+  const shopFilter = shopId
+    ? "AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')"
+    : "";
+  if (shopId) {
+    request.input("shopId", sql.NVarChar(100), String(shopId));
+  }
+
+  await request.query(`
       UPDATE dbo.MarketplaceConnection
       SET
         AccessToken = NULL,
         RefreshToken = NULL,
         AccessTokenExpiresAt = NULL,
         RefreshTokenExpiresAt = NULL,
-        ShopCipher = NULL,
-        ShopId = NULL,
-        ShopName = NULL,
-        SellerId = NULL,
-        AuthorizedAt = NULL,
-        LastSyncAt = NULL,
-        LastRefreshAt = NULL,
         ConnectionStatus = N'DISCONNECTED',
         UpdatedAt = GETDATE()
       WHERE Platform = @platform
+        AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
+        ${shopFilter}
     `);
 
-  console.log(`Cleared marketplace connection: ${platform}`);
+  console.log(`Cleared marketplace connection: ${platform}${shopId ? ` shop=${shopId}` : ""}`);
 }
 
 function revealTokens(row) {

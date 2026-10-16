@@ -18,7 +18,7 @@ async function main() {
       SELECT
         ConnectionId,
         ROW_NUMBER() OVER (
-          PARTITION BY Platform
+          PARTITION BY Platform, ISNULL(ShopId, N'')
           ORDER BY UpdatedAt DESC, ConnectionId DESC
         ) AS rn
       FROM dbo.MarketplaceConnection
@@ -29,13 +29,21 @@ async function main() {
 
   try {
     await pool.request().query(`
-      IF NOT EXISTS (
+      IF EXISTS (
         SELECT 1 FROM sys.indexes
         WHERE name = N'UX_MarketplaceConnection_Platform'
           AND object_id = OBJECT_ID(N'dbo.MarketplaceConnection')
       )
-      CREATE UNIQUE INDEX UX_MarketplaceConnection_Platform
-        ON dbo.MarketplaceConnection (Platform);
+        DROP INDEX UX_MarketplaceConnection_Platform ON dbo.MarketplaceConnection;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM sys.indexes
+        WHERE name = N'UX_MarketplaceConnection_Platform_ShopId'
+          AND object_id = OBJECT_ID(N'dbo.MarketplaceConnection')
+      )
+      CREATE UNIQUE INDEX UX_MarketplaceConnection_Platform_ShopId
+        ON dbo.MarketplaceConnection (Platform, ShopId)
+        WHERE ShopId IS NOT NULL;
     `);
     console.log("UNIQUE_INDEX ok");
   } catch (e) {

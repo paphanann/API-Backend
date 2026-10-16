@@ -139,6 +139,14 @@ function visibleText(value, fallback = null) {
   return trimmed;
 }
 
+function clipText(value, max) {
+  const raw = text(value, null);
+  if (!raw || !max) return raw;
+  const cleaned = raw.replace(/\*{4,}/g, "").replace(/\s+/g, " ").trim();
+  const next = cleaned || raw;
+  return next.length <= max ? next : next.slice(0, max);
+}
+
 function mapOrderStatus(raw) {
   const value = String(raw || "").toLowerCase();
 
@@ -251,6 +259,7 @@ module.exports = {
   splitOrderAmounts,
   text,
   visibleText,
+  clipText,
   mapOrderStatus,
   mapShippingStatus,
   mapProductStatus,

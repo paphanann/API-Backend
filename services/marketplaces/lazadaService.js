@@ -3,6 +3,8 @@ const axios = require("axios");
 
 const connectionStore = require("../stores/connectionStore");
 const tokenService = require("../tokenService");
+const { marketplaceTimeoutMs } = require("../../utils/httpTimeout");
+const { mapPool } = require("../../utils/mapPool");
 const {
   expiryDate,
   toDate,
@@ -81,7 +83,7 @@ async function lazadaCall(path, extra = {}, accessToken, host) {
 
   const { data } = await axios.get(`${base}${path}`, {
     params,
-    timeout: 30000,
+    timeout: marketplaceTimeoutMs(),
   });
 
   if (data && data.code && String(data.code) !== "0") {
@@ -221,6 +223,7 @@ async function refreshShopProfile(connection) {
   }
 
   await connectionStore.updateConnectedShop("Lazada", {
+    fromShopId: connection.shopId,
     shopId: mapped.shopId,
     shopName: mapped.shopName,
     sellerId: mapped.sellerId,
@@ -255,17 +258,27 @@ async function completeOAuth(query) {
     throw new Error("แลก token จาก Lazada ไม่สำเร็จ");
   }
 
-  const profile = await fetchSellerProfile(payload.access_token);
-  const mapped = mapSellerFields(payload, profile);
+  const saved = await importTokenPayload(payload);
+  return saved;
+}
+
+async function importTokenPayload(payload) {
+  const body = payload && (payload.access_token ? payload : payload.data);
+  if (!body || !body.access_token || !body.refresh_token) {
+    throw new Error("ไฟล์โทเค็น Lazada ไม่ครบ access_token หรือ refresh_token");
+  }
+
+  const profile = await fetchSellerProfile(body.access_token);
+  const mapped = mapSellerFields(body, profile);
 
   await saveShopConnection({
     shopId: mapped.shopId,
     shopName: mapped.shopName,
     sellerId: mapped.sellerId,
-    accessToken: payload.access_token,
-    refreshToken: payload.refresh_token,
-    accessTokenExpireAt: expiryDate(payload.expires_in || payload.expire_in),
-    refreshTokenExpireAt: expiryDate(payload.refresh_expires_in),
+    accessToken: body.access_token,
+    refreshToken: body.refresh_token,
+    accessTokenExpireAt: expiryDate(body.expires_in || body.expire_in),
+    refreshTokenExpireAt: expiryDate(body.refresh_expires_in),
   });
 
   console.log(
@@ -428,32 +441,42 @@ function normalizeProduct(product) {
   };
 }
 
-const { resolveSyncWindow } = require("../../utils/syncWindow");
+const { resolveSyncWindow, timeChunks } = require("../../utils/syncWindow");
 
-async function fetchOrders(connection, options = {}) {
-  const window = resolveSyncWindow(connection, {
-    maxMs: 14 * 24 * 60 * 60 * 1000,
-    firstMs: 14 * 24 * 60 * 60 * 1000,
-    ...options.window,
-  });
-
-  const params = {
-    limit: "50",
-    offset: "0",
-  };
-
-  if (window.incremental) {
-    params.update_after = window.sinceLazada;
+async function fetchLazadaOrderPage(connection, range, options = {}) {
+  const params = {};
+  if (range.incremental) {
+    params.update_after = range.sinceLazada;
+    params.update_before = range.untilLazada;
   } else {
-    params.created_after = window.sinceLazada;
+    params.created_after = range.sinceLazada;
+    params.created_before = range.untilLazada;
   }
 
-  const data = await lazadaCall("/orders/get", params, connection.accessToken);
+  const rows = [];
+  const limit = 100;
+  let offset = 0;
+  for (; offset < 100000; offset += limit) {
+    const data = await lazadaCall(
+      "/orders/get",
+      { ...params, limit: String(limit), offset: String(offset) },
+      connection.accessToken
+    );
+    const list = (data.data && data.data.orders) || data.orders || [];
+    rows.push(...list);
+    const total = Number(data.data && data.data.countTotal);
+    if (list.length < limit) break;
+    if (Number.isFinite(total) && offset + list.length >= total) break;
+  }
+  if (offset >= 100000) {
+    console.warn(`Lazada orders hit page cap shop=${connection.shopId || "-"} offset=${offset}`);
+  }
 
-  const list = (data.data && data.data.orders) || data.orders || [];
-  const orders = [];
+  if (options.skipDetails) {
+    return rows.map((row) => normalizeOrder(row));
+  }
 
-  for (const row of list) {
+  return mapPool(rows, 2, async (row) => {
     try {
       const full = await lazadaCall(
         "/order/get",
@@ -482,9 +505,35 @@ async function fetchOrders(connection, options = {}) {
       row.items = [];
     }
 
-    orders.push(normalizeOrder(row));
-  }
+    return normalizeOrder(row);
+  });
+}
 
+async function fetchOrders(connection, options = {}) {
+  const window = resolveSyncWindow(connection, {
+    maxMs: 14 * 24 * 60 * 60 * 1000,
+    firstMs: 14 * 24 * 60 * 60 * 1000,
+    ...options.window,
+  });
+  const ranges = window.incremental
+    ? [window]
+    : timeChunks(window.sinceMs, window.untilMs, 30 * 24 * 60 * 60 * 1000);
+
+  const seen = new Set();
+  const orders = [];
+  for (const range of ranges) {
+    const page = await fetchLazadaOrderPage(connection, range, options);
+    console.log(`Lazada orders ${String(range.sinceLazada).slice(0, 10)} ${page.length}`);
+    if (typeof options.onChunk === "function") {
+      await options.onChunk(page);
+    }
+    for (const order of page) {
+      const id = order && order.marketplaceOrderId;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      orders.push(order);
+    }
+  }
   return orders;
 }
 
@@ -528,6 +577,7 @@ module.exports = {
   exchangeCodeForToken,
   saveShopConnection,
   completeOAuth,
+  importTokenPayload,
   ensureFreshTokens,
   fetchSellerProfile,
   refreshShopProfile,
