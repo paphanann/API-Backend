@@ -17,30 +17,73 @@ const services = {
   Lazada: lazadaService,
 };
 
+function sapDocArgs(order) {
+  return [order.platform, order.marketplaceOrderId, order.shopId, order.companyId];
+}
+
+async function rememberSapDoc(order, docNum) {
+  await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, docNum, "sap_ok", order.shopId, order.companyId);
+}
+
 async function pushToSap(order) {
+  const [, , shopId, companyId] = sapDocArgs(order);
   if (!sapService.isConfigured()) {
-    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, null, "saved", order.shopId);
+    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, null, "saved", shopId, companyId);
     return { status: "skipped" };
   }
 
+  // อัปเดต SQL ไปแล้วก่อนถึงจุดนี้ การเปิดใบสั่งขายเป็นอีกเงื่อนไข
+  const claim = await orderStore.claimSapSend(order);
+  if (!claim.claimed) {
+    return { status: "skipped", docNum: claim.sapDocNum || null };
+  }
+
   try {
+    const existing = await sapService.findSalesOrder(order);
+    if (existing) {
+      if (sapService.orderIsCancelled(order)) await sapService.cancelSalesOrder(order);
+      await rememberSapDoc(order, existing);
+      return { status: "ok", docNum: existing, recovered: true };
+    }
+
     const docNum = await sapService.createSalesOrder(order);
-    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, docNum, "sap_ok", order.shopId);
-    return { status: "ok", docNum };
+    const savedNum = docNum || (await sapService.findSalesOrder(order));
+    if (!savedNum) {
+      throw new Error("SAP ไม่คืนเลขเอกสาร");
+    }
+    if (sapService.orderIsCancelled(order)) await sapService.cancelSalesOrder(order);
+    await rememberSapDoc(order, savedNum);
+    return { status: "ok", docNum: savedNum };
   } catch (error) {
-    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, null, "sap_error", order.shopId);
+    const recovered = await sapService.findSalesOrder(order).catch(() => null);
+    if (recovered && sapService.orderIsCancelled(order)) {
+      try {
+        await sapService.cancelSalesOrder(order);
+      } catch (cancelError) {
+        await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, null, "sap_error", shopId, companyId);
+        return { status: "error", message: publicError(cancelError, "SAP error") };
+      }
+      await rememberSapDoc(order, recovered);
+      return { status: "ok", docNum: recovered, recovered: true };
+    }
+    if (recovered) {
+      await rememberSapDoc(order, recovered);
+      return { status: "ok", docNum: recovered, recovered: true };
+    }
+    await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, null, "sap_error", shopId, companyId);
     return { status: "error", message: publicError(error, "SAP error") };
   }
 }
 
 function shouldCreateSalesOrder(order, result) {
-  if (result && result.sapDocNum) {
+  const change = result && result.change;
+  if (change !== "inserted" && change !== "updated") {
     return false;
   }
-  if (result && String(result.syncStatus || "").toLowerCase() === "history") {
-    return false;
-  }
-  return String(order.orderStatus || "").toLowerCase() !== "cancelled";
+  const status = String((result && result.syncStatus) || "").toLowerCase();
+  if (result && result.sapDocNum) return false;
+  if (status === "sap_ok" || status === "history") return false;
+  return true;
 }
 
 function sapDetailMessage(sap, change) {
@@ -264,8 +307,12 @@ async function syncConnectedShop(platform, connection, options = {}) {
           await productStore.deleteMissing(platform, keptIds, shopId);
         }
 
-        if (sapService.isConfigured()) {
+        if (sapService.isConfigured() && keptIds.length) {
           try {
+            const pushed = await sapService.pushProducts(
+              products.filter((product) => product && keptIds.includes(String(product.productId)))
+            );
+            console.log(`SAP OITM ${platform}: saved ${pushed.saved} failed ${pushed.failed}`);
             await sapService.mapStoredProducts(platform);
           } catch (error) {
             console.error(`SAP item map failed for ${platform}:`, error.message);
@@ -424,8 +471,57 @@ async function syncPlatform(platform, options = {}) {
   };
 }
 
+async function postStoredSalesOrders(options = {}) {
+  if (!sapService.isConfigured()) {
+    return { total: 0, ok: 0, failed: 0, errors: ["ยังไม่ได้ตั้งค่า SAP"] };
+  }
+
+  const pending = await orderStore.listOrdersForSap();
+  const orders = options.limit ? pending.slice(0, options.limit) : pending;
+  const indexes = new Map();
+  let ok = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const order of orders) {
+    const key = `${order.platform}\0${order.shopId || ""}`;
+    if (!indexes.has(key)) {
+      indexes.set(
+        key,
+        productStore.sapCodeIndex(await productStore.listProducts(order.platform, order.shopId))
+      );
+    }
+    const sapIndex = indexes.get(key);
+    order.lines = (order.lines || []).map((line) => {
+      const codes = sapIndex.get(String(line.sku || "").trim()) || [];
+      return {
+        ...line,
+        sapItemCode: codes.length === 1 ? codes[0] : null,
+        sapAmbiguous: codes.length > 1,
+      };
+    });
+
+    const sap = await pushToSap(order);
+    if (sap.status === "ok") {
+      ok += 1;
+    } else if (sap.status === "error") {
+      failed += 1;
+      if (errors.length < 8) {
+        errors.push(`${order.platform} ${order.marketplaceOrderId}: ${sap.message || "error"}`);
+      }
+    }
+    const done = ok + failed;
+    if (done === 1 || done % 50 === 0 || done === orders.length) {
+      console.log(`SAP sales orders ${done}/${orders.length} ok=${ok} failed=${failed}`);
+    }
+  }
+
+  return { total: orders.length, pending: pending.length, ok, failed, errors };
+}
+
 module.exports = {
   syncPlatform,
+  postStoredSalesOrders,
   syncAllConnected: async () => {
     const { syncAllConnected } = require("./orderSyncJob");
     return syncAllConnected();

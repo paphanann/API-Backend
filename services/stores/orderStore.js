@@ -1,7 +1,7 @@
 const { poolPromise, sql } = require("../../config/database");
 const { currentCompanyId } = require("./companyContext");
 const { startTimer } = require("../../utils/timing");
-const { splitOrderAmounts, mapShippingStatus, mapOrderStatus, clipText } = require("../../utils/normalize");
+const { splitOrderAmounts, mapShippingStatus, mapOrderStatus, clipText, roundMoney } = require("../../utils/normalize");
 const { ensureSchema } = require("./schema");
 
 function linesJson(order) {
@@ -33,24 +33,49 @@ function sameDate(a, b) {
   const left = a instanceof Date ? a.getTime() : new Date(a).getTime();
   const right = b instanceof Date ? b.getTime() : new Date(b).getTime();
   if (Number.isNaN(left) && Number.isNaN(right)) return true;
-  return left === right;
+  return Math.abs(left - right) < 1500;
+}
+
+function lineKey(line) {
+  return {
+    sku: normText(line && (line.sku != null ? line.sku : line.Sku)),
+    name: normText(line && (line.name != null ? line.name : line.Name)),
+    qty: Number(line && (line.qty != null ? line.qty : line.Qty)) || 0,
+    price: roundMoney(line && (line.price != null ? line.price : line.Price)),
+  };
+}
+
+function canonicalItems(value) {
+  let lines = value;
+  if (typeof value === "string") {
+    try {
+      lines = value.trim() ? JSON.parse(value) : [];
+    } catch {
+      lines = [];
+    }
+  }
+  if (!Array.isArray(lines)) lines = [];
+  const keys = lines.map(lineKey).sort((a, b) =>
+    `${a.sku}|${a.name}|${a.qty}|${a.price}`.localeCompare(`${b.sku}|${b.name}|${b.qty}|${b.price}`)
+  );
+  return JSON.stringify(keys);
 }
 
 function orderFingerprint(row) {
   return JSON.stringify({
-    customerName: normText(row.CustomerName || row.customerName),
-    customerPhone: normText(row.CustomerPhone || row.customerPhone),
-    shippingAddress: normText(row.ShippingAddress || row.shippingAddress),
+    customerName: clipText(row.CustomerName || row.customerName, 255) || "",
+    customerPhone: clipText(row.CustomerPhone || row.customerPhone, 50) || "",
+    shippingAddress: clipText(row.ShippingAddress || row.shippingAddress, 500) || "",
     orderStatus: normText(row.OrderStatus || row.orderStatus).toLowerCase(),
-    paymentMethod: normText(row.PaymentMethod || row.paymentMethod),
-    shippingMethod: normText(row.ShippingMethod || row.shippingMethod),
-    platformStatus: normText(row.PlatformStatus || row.platformStatus),
-    totalAmount: normAmount(row.TotalAmount != null ? row.TotalAmount : row.totalAmount),
-    itemAmount: normAmount(row.ItemAmount != null ? row.ItemAmount : row.itemAmount),
-    discountAmount: normAmount(row.DiscountAmount != null ? row.DiscountAmount : row.discountAmount),
-    shippingAmount: normAmount(row.ShippingAmount != null ? row.ShippingAmount : row.shippingAmount),
+    paymentMethod: clipText(row.PaymentMethod || row.paymentMethod, 100) || "",
+    shippingMethod: clipText(row.ShippingMethod || row.shippingMethod, 100) || "",
+    platformStatus: clipText(row.PlatformStatus || row.platformStatus, 80) || "",
+    totalAmount: roundMoney(row.TotalAmount != null ? row.TotalAmount : row.totalAmount),
+    itemAmount: roundMoney(row.ItemAmount != null ? row.ItemAmount : row.itemAmount),
+    discountAmount: roundMoney(row.DiscountAmount != null ? row.DiscountAmount : row.discountAmount),
+    shippingAmount: roundMoney(row.ShippingAmount != null ? row.ShippingAmount : row.shippingAmount),
     currency: normText(row.Currency || row.currency).toUpperCase(),
-    itemsJson: normText(row.ItemsJson || row.itemsJson || linesJson({ lines: row.lines })),
+    itemsJson: canonicalItems(row.ItemsJson || row.itemsJson || row.lines),
   });
 }
 
@@ -300,25 +325,81 @@ async function upsertOrder(order) {
   return result;
 }
 
+function sapKeyInputs(request, platform, marketplaceOrderId, shopId, companyId) {
+  request.input("platform", platform);
+  request.input("companyId", companyId);
+  request.input("orderId", String(marketplaceOrderId));
+  request.input("shopId", shopId ? String(shopId) : null);
+}
+
+async function readSapState(platform, marketplaceOrderId, shopId, companyId) {
+  const pool = await poolPromise;
+  const company = companyId ? String(companyId) : await currentCompanyId();
+  const request = pool.request();
+  sapKeyInputs(request, platform, marketplaceOrderId, shopId, company);
+  const result = await request.query(`
+    SELECT TOP 1 SapDocNum, SyncStatus
+    FROM dbo.MarketplaceOrder
+    WHERE Platform = @platform
+      AND MarketplaceOrderId = @orderId
+      ${shopMatchSql()}
+  `);
+  const row = result.recordset[0] || {};
+  const sapDocNum = row.SapDocNum ? String(row.SapDocNum).trim() : "";
+  return {
+    sapDocNum: sapDocNum || null,
+    syncStatus: row.SyncStatus || null,
+  };
+}
+
+async function claimSapSend(order) {
+  const pool = await poolPromise;
+  const company = order.companyId ? String(order.companyId) : await currentCompanyId();
+  const request = pool.request();
+  sapKeyInputs(request, order.platform, order.marketplaceOrderId, order.shopId, company);
+  const claim = await request.query(`
+    UPDATE dbo.MarketplaceOrder
+    SET SyncStatus = N'sap_sending', LastSyncedAt = GETDATE()
+    WHERE Platform = @platform
+      AND MarketplaceOrderId = @orderId
+      ${shopMatchSql()}
+      AND (SapDocNum IS NULL OR LTRIM(RTRIM(SapDocNum)) = N'')
+      AND ISNULL(SyncStatus, N'') <> N'sap_ok'
+      AND (
+        ISNULL(SyncStatus, N'') <> N'sap_sending'
+        OR LastSyncedAt < DATEADD(MINUTE, -10, GETDATE())
+      )
+  `);
+  const state = await readSapState(order.platform, order.marketplaceOrderId, order.shopId, company);
+  return {
+    claimed: Boolean(claim.rowsAffected && claim.rowsAffected[0] > 0),
+    sapDocNum: state.sapDocNum,
+    syncStatus: state.syncStatus,
+  };
+}
+
 async function setSapDoc(platform, marketplaceOrderId, sapDocNum, syncStatus, shopId, companyId) {
   const pool = await poolPromise;
   const company = companyId ? String(companyId) : await currentCompanyId();
-
-  await pool
-    .request()
-    .input("platform", platform)
-    .input("companyId", company)
-    .input("orderId", String(marketplaceOrderId))
-    .input("sapDocNum", sapDocNum || null)
-    .input("syncStatus", syncStatus || "sap_ok")
-    .input("shopId", shopId ? String(shopId) : null)
-    .query(`
-      UPDATE dbo.MarketplaceOrder
-      SET SapDocNum = @sapDocNum, SyncStatus = @syncStatus, LastSyncedAt = GETDATE()
-      WHERE Platform = @platform
-        AND MarketplaceOrderId = @orderId
-        ${shopMatchSql()}
-    `);
+  const request = pool.request();
+  sapKeyInputs(request, platform, marketplaceOrderId, shopId, company);
+  request.input("sapDocNum", sapDocNum ? String(sapDocNum) : null);
+  request.input("syncStatus", syncStatus || "sap_ok");
+  await request.query(`
+    UPDATE dbo.MarketplaceOrder
+    SET
+      SapDocNum = COALESCE(NULLIF(LTRIM(RTRIM(@sapDocNum)), N''), SapDocNum),
+      SyncStatus = CASE
+        WHEN NULLIF(LTRIM(RTRIM(@sapDocNum)), N'') IS NOT NULL THEN @syncStatus
+        WHEN NULLIF(LTRIM(RTRIM(SapDocNum)), N'') IS NOT NULL THEN SyncStatus
+        WHEN SyncStatus = N'history' THEN SyncStatus
+        ELSE @syncStatus
+      END,
+      LastSyncedAt = GETDATE()
+    WHERE Platform = @platform
+      AND MarketplaceOrderId = @orderId
+      ${shopMatchSql()}
+  `);
 }
 
 function presentAmounts(order, lines) {
@@ -441,9 +522,42 @@ async function listOrders(platform, marketplaceOrderId) {
   });
 }
 
+async function listOrdersForSap() {
+  await ensureSchema();
+  const pool = await poolPromise;
+  const companyId = await currentCompanyId();
+  const result = await pool.request().input("companyId", companyId).query(`
+    SELECT
+      Platform,
+      CompanyId,
+      ShopId,
+      MarketplaceOrderId,
+      OrderDate,
+      OrderStatus,
+      ItemsJson
+    FROM dbo.MarketplaceOrder
+    WHERE ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
+      AND ISNULL(SyncStatus, N'') <> N'sap_ok'
+      AND (SapDocNum IS NULL OR LTRIM(RTRIM(SapDocNum)) = N'')
+    ORDER BY OrderDate ASC, Id ASC
+  `);
+
+  return result.recordset.map((row) => ({
+    platform: row.Platform,
+    companyId: row.CompanyId,
+    shopId: row.ShopId,
+    marketplaceOrderId: row.MarketplaceOrderId,
+    orderDate: row.OrderDate,
+    orderStatus: row.OrderStatus,
+    lines: parseLines(row.ItemsJson),
+  }));
+}
+
 module.exports = {
   upsertOrder,
   upsertOrders,
+  claimSapSend,
   setSapDoc,
   listOrders,
+  listOrdersForSap,
 };

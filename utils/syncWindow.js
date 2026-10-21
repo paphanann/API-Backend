@@ -1,6 +1,6 @@
 /** หน้าต่างเวลาสำหรับ incremental sync */
 
-const DEFAULT_LOOKBACK_MS = 30 * 60 * 1000; // กันพลาดขอบรอบก่อน
+const DEFAULT_LOOKBACK_MS = 10 * 60 * 1000; // เผื่อรอบที่ซิงก์นาน ไม่วนดึงออเดอร์เดิมทั้งครึ่งชั่วโมง
 const DEFAULT_MAX_MS = 14 * 24 * 60 * 60 * 1000;
 const DEFAULT_FIRST_MS = 14 * 24 * 60 * 60 * 1000;
 

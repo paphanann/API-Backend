@@ -197,9 +197,27 @@ router.get("/sap-items", async (req, res) => {
   }
 });
 
+async function sapWarehouses() {
+  if (!sapService.isConfigured()) return [];
+  try {
+    return await sapService.listWarehouses();
+  } catch (error) {
+    console.error("SAP warehouses failed:", error.message);
+    return [];
+  }
+}
+
 router.get("/erp-options", async (req, res) => {
   try {
-    const empty = { cardCodes: [], warehouses: [], branches: [], taxCodes: [] };
+    const warehouseNames = await sapWarehouses();
+    const warehouseCodes = warehouseNames.map((row) => row.code);
+    const empty = {
+      cardCodes: [],
+      warehouses: warehouseCodes,
+      warehouseNames,
+      branches: [],
+      taxCodes: [],
+    };
     const creds = await settingsStore.getErpCredentials();
     if (!creds.baseUrl || !creds.companyDb || !creds.username || !creds.password) {
       return res.json(empty);
@@ -244,7 +262,9 @@ router.get("/erp-options", async (req, res) => {
       "/BusinessPartners?$select=CardCode&$filter=CardType eq 'C'&$top=200",
       ["CardCode"]
     );
-    const warehouses = await codes("/Warehouses?$select=WarehouseCode&$top=200", ["WarehouseCode"]);
+    const warehouses = warehouseCodes.length
+      ? warehouseCodes
+      : await codes("/Warehouses?$select=WarehouseCode&$top=200", ["WarehouseCode"]);
     const branches = await codes("/BusinessPlaces?$select=BPLName,BPLID&$top=200", ["BPLName", "BPLID"]);
     let taxCodes = await codes("/SalesTaxCodes?$select=Code&$top=200", ["Code"]);
     if (!taxCodes.length) {
@@ -257,10 +277,17 @@ router.get("/erp-options", async (req, res) => {
       /* ignore */
     }
 
-    res.json({ cardCodes, warehouses, branches, taxCodes });
+    res.json({ cardCodes, warehouses, warehouseNames, branches, taxCodes });
   } catch (error) {
     console.error(error);
-    res.json({ cardCodes: [], warehouses: [], branches: [], taxCodes: [] });
+    const warehouseNames = await sapWarehouses();
+    res.json({
+      cardCodes: [],
+      warehouses: warehouseNames.map((row) => row.code),
+      warehouseNames,
+      branches: [],
+      taxCodes: [],
+    });
   }
 });
 
