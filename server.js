@@ -131,10 +131,11 @@ app.use("/api/sync", syncRoutes);
 app.use("/api/tiktok", tiktokRoutes);
 app.use("/api/lazada", lazadaRoutes);
 
-ensureSchema().catch((error) => {
-  console.error("Schema ensure failed:", error.message);
-});
-
+if (process.env.ENABLE_DB_INIT === "true") {
+  ensureSchema().catch((error) => {
+    console.error("Schema ensure failed:", error.message);
+  });
+}
 
 
 const PORT = process.env.PORT || 3000;
@@ -151,7 +152,9 @@ app.listen(PORT, "0.0.0.0", () => {
       .filter(Boolean)
       .join(", ") || "none"
   );
+ if (process.env.ENABLE_BACKGROUND_JOBS === "true") {
   startTokenRefreshJob();
   startOrderSyncJob();
   startSapMapJob();
+}
 });

@@ -37,7 +37,7 @@ function asThaiIso(value) {
   const h = pad(d.getUTCHours());
   const min = pad(d.getUTCMinutes());
   const sec = pad(d.getUTCSeconds());
-  return `${y}-${m}-${day}T${h}:${min}:${sec}+07:00`;
+  return `${y}-${m}-${day}T${h}:${min}:${sec}`;
 }
 
 async function saveConnection(fields) {
@@ -317,7 +317,8 @@ async function listPublicConnections() {
       CASE WHEN AccessToken IS NOT NULL AND LEN(AccessToken) > 0 THEN 1 ELSE 0 END AS HasAccessToken,
       CASE WHEN RefreshToken IS NOT NULL AND LEN(RefreshToken) > 0 THEN 1 ELSE 0 END AS HasRefreshToken,
       AccessTokenExpiresAt,
-      RefreshTokenExpiresAt
+      RefreshTokenExpiresAt,
+      WarehouseCode
     FROM dbo.MarketplaceConnection
     WHERE ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
     ORDER BY UpdatedAt DESC
@@ -379,6 +380,12 @@ async function listPublicConnections() {
         ? "TikTok ยังไม่มี shop_cipher — เปิด scope ใน Partner Center แล้ว Connect ใหม่"
         : null,
       Cleared: 0,
+      Warehouse: row.WarehouseCode || null,
+      warehouse: row.WarehouseCode || null,
+      WhsCode: row.WarehouseCode || null,
+      whsCode: row.WarehouseCode || null,
+      WarehouseCode: row.WarehouseCode || null,
+      warehouseCode: row.WarehouseCode || null,
     });
   }
 
@@ -454,6 +461,27 @@ function assertLiveToken(accessToken) {
   tokenService.assertLiveToken(accessToken);
 }
 
+async function setShopWarehouse({ platform, shopId, warehouseCode }) {
+  await ensureSchema();
+  const pool = await poolPromise;
+  const companyId = await currentCompanyId();
+  const result = await pool
+    .request()
+    .input("companyId", sql.NVarChar(100), companyId)
+    .input("platform", sql.NVarChar(50), String(platform || "").trim())
+    .input("shopId", sql.NVarChar(100), String(shopId || "").trim())
+    .input("warehouseCode", sql.NVarChar(50), warehouseCode)
+    .query(`
+      UPDATE dbo.MarketplaceConnection
+      SET WarehouseCode = @warehouseCode, UpdatedAt = GETDATE()
+      WHERE LOWER(Platform) = LOWER(@platform)
+        AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
+        AND ShopId = @shopId;
+      SELECT @@ROWCOUNT AS Updated;
+    `);
+  return Number(result.recordset && result.recordset[0] && result.recordset[0].Updated) || 0;
+}
+
 module.exports = {
   saveConnection,
   updateConnectedShop,
@@ -463,6 +491,7 @@ module.exports = {
   updateTokens,
   touchSync,
   listPublicConnections,
+  setShopWarehouse,
   disconnectPlatform,
   deleteShop,
   assertLiveToken,

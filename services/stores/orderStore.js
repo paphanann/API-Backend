@@ -3,6 +3,7 @@ const { currentCompanyId } = require("./companyContext");
 const { startTimer } = require("../../utils/timing");
 const { splitOrderAmounts, mapShippingStatus, mapOrderStatus, clipText, roundMoney } = require("../../utils/normalize");
 const { ensureSchema } = require("./schema");
+const transferStore = require("./transferStore");
 
 function linesJson(order) {
   const lines = Array.isArray(order.lines) ? order.lines : [];
@@ -14,10 +15,11 @@ function normText(value) {
   return String(value).trim();
 }
 
-function storedClock(value) {
+function storedClock(value, offsetMs = 0) {
   if (value == null || value === "") return value;
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  const date = offsetMs ? new Date(parsed.getTime() + offsetMs) : parsed;
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
 }
@@ -65,6 +67,8 @@ function orderFingerprint(row) {
   return JSON.stringify({
     customerName: clipText(row.CustomerName || row.customerName, 255) || "",
     customerPhone: clipText(row.CustomerPhone || row.customerPhone, 50) || "",
+    customerEmail: clipText(row.CustomerEmail || row.customerEmail || row.email, 120) || "",
+    trackingNo: clipText(row.TrackingNo || row.trackingNo || row.trackingNumber, 50) || "",
     shippingAddress: clipText(row.ShippingAddress || row.shippingAddress, 500) || "",
     orderStatus: normText(row.OrderStatus || row.orderStatus).toLowerCase(),
     paymentMethod: clipText(row.PaymentMethod || row.paymentMethod, 100) || "",
@@ -107,6 +111,8 @@ function prepareOrder(order, fallbackCompany) {
     nextFp: orderFingerprint({
       customerName: order.customerName,
       customerPhone: order.customerPhone,
+      customerEmail: order.email || order.customerEmail,
+      trackingNo: order.trackingNo || order.trackingNumber,
       shippingAddress: order.shippingAddress,
       orderStatus: order.orderStatus,
       paymentMethod: order.paymentMethod,
@@ -129,6 +135,8 @@ function bindOrderInputs(request, prefix, row, syncStatus) {
   request.input(`${prefix}orderId`, row.orderId);
   request.input(`${prefix}customerName`, clipText(order.customerName, 255));
   request.input(`${prefix}customerPhone`, clipText(order.customerPhone, 50));
+  request.input(`${prefix}customerEmail`, clipText(order.email || order.customerEmail, 120));
+  request.input(`${prefix}trackingNo`, clipText(order.trackingNo || order.trackingNumber, 50));
   request.input(`${prefix}shippingAddress`, clipText(order.shippingAddress, 500));
   request.input(`${prefix}orderDate`, order.orderDate || null);
   request.input(`${prefix}orderStatus`, clipText(order.orderStatus, 50));
@@ -159,9 +167,9 @@ async function loadExistingOrders(db, platform, shopId, companyId, ids) {
     });
     const result = await request.query(`
       SELECT
-        MarketplaceOrderId, CustomerName, CustomerPhone, ShippingAddress, OrderDate, OrderStatus,
+        MarketplaceOrderId, CustomerName, CustomerPhone, CustomerEmail, TrackingNo, ShippingAddress, OrderDate, OrderStatus,
         PaymentMethod, ShippingMethod, PlatformStatus, TotalAmount, ItemAmount, DiscountAmount, ShippingAmount,
-        Currency, ItemsJson, SyncStatus, SapDocNum
+        Currency, ItemsJson, SyncStatus, SapDocNum, DeliveryDocNum, ReturnRequestDocNum
       FROM dbo.MarketplaceOrder
       WHERE Platform = @platform
         AND MarketplaceOrderId IN (${names.join(", ")})
@@ -179,7 +187,7 @@ async function insertOrderRows(db, rows) {
       const prefix = `r${index}`;
       bindOrderInputs(request, prefix, row, row.order.syncStatus || "saved");
       return `(
-        @${prefix}platform, @${prefix}companyId, @${prefix}orderId, @${prefix}shopId, @${prefix}shopName, @${prefix}customerName, @${prefix}customerPhone, @${prefix}shippingAddress,
+        @${prefix}platform, @${prefix}companyId, @${prefix}orderId, @${prefix}shopId, @${prefix}shopName, @${prefix}customerName, @${prefix}customerPhone, @${prefix}customerEmail, @${prefix}trackingNo, @${prefix}shippingAddress,
         @${prefix}orderDate, @${prefix}orderStatus, @${prefix}paymentMethod, @${prefix}shippingMethod, @${prefix}platformStatus, @${prefix}totalAmount,
         @${prefix}itemAmount, @${prefix}discountAmount, @${prefix}shippingAmount,
         @${prefix}currency, @${prefix}syncStatus, @${prefix}itemsJson, GETDATE()
@@ -188,7 +196,7 @@ async function insertOrderRows(db, rows) {
     await request.query(`
       INSERT INTO dbo.MarketplaceOrder
       (
-        Platform, CompanyId, MarketplaceOrderId, ShopId, ShopName, CustomerName, CustomerPhone, ShippingAddress,
+        Platform, CompanyId, MarketplaceOrderId, ShopId, ShopName, CustomerName, CustomerPhone, CustomerEmail, TrackingNo, ShippingAddress,
         OrderDate, OrderStatus, PaymentMethod, ShippingMethod, PlatformStatus, TotalAmount,
         ItemAmount, DiscountAmount, ShippingAmount,
         Currency, SyncStatus, ItemsJson, LastSyncedAt
@@ -229,6 +237,8 @@ async function updateOrderRow(db, row) {
     SET
       CustomerName = @customerName,
       CustomerPhone = @customerPhone,
+      CustomerEmail = @customerEmail,
+      TrackingNo = @trackingNo,
       ShippingAddress = @shippingAddress,
       OrderDate = @orderDate,
       OrderStatus = @orderStatus,
@@ -293,6 +303,8 @@ async function upsertOrders(orders) {
           change: "unchanged",
           syncStatus: prev.SyncStatus || null,
           sapDocNum: prev.SapDocNum || null,
+          deliveryDocNum: prev.DeliveryDocNum || null,
+          returnRequestDocNum: prev.ReturnRequestDocNum || null,
         });
         continue;
       }
@@ -301,6 +313,8 @@ async function upsertOrders(orders) {
         change: "updated",
         syncStatus: prev.SyncStatus || null,
         sapDocNum: prev.SapDocNum || null,
+        deliveryDocNum: prev.DeliveryDocNum || null,
+        returnRequestDocNum: prev.ReturnRequestDocNum || null,
       });
     }
 
@@ -378,6 +392,36 @@ async function claimSapSend(order) {
   };
 }
 
+async function setReturnRequestDoc(platform, marketplaceOrderId, returnRequestDocNum, shopId, companyId) {
+  const pool = await poolPromise;
+  const company = companyId ? String(companyId) : await currentCompanyId();
+  const request = pool.request();
+  sapKeyInputs(request, platform, marketplaceOrderId, shopId, company);
+  request.input("returnRequestDocNum", returnRequestDocNum ? String(returnRequestDocNum) : null);
+  await request.query(`
+    UPDATE dbo.MarketplaceOrder
+    SET ReturnRequestDocNum = COALESCE(NULLIF(LTRIM(RTRIM(@returnRequestDocNum)), N''), ReturnRequestDocNum)
+    WHERE Platform = @platform
+      AND MarketplaceOrderId = @orderId
+      ${shopMatchSql()}
+  `);
+}
+
+async function setDeliveryDoc(platform, marketplaceOrderId, deliveryDocNum, shopId, companyId) {
+  const pool = await poolPromise;
+  const company = companyId ? String(companyId) : await currentCompanyId();
+  const request = pool.request();
+  sapKeyInputs(request, platform, marketplaceOrderId, shopId, company);
+  request.input("deliveryDocNum", deliveryDocNum ? String(deliveryDocNum) : null);
+  await request.query(`
+    UPDATE dbo.MarketplaceOrder
+    SET DeliveryDocNum = COALESCE(NULLIF(LTRIM(RTRIM(@deliveryDocNum)), N''), DeliveryDocNum)
+    WHERE Platform = @platform
+      AND MarketplaceOrderId = @orderId
+      ${shopMatchSql()}
+  `);
+}
+
 async function setSapDoc(platform, marketplaceOrderId, sapDocNum, syncStatus, shopId, companyId) {
   const pool = await poolPromise;
   const company = companyId ? String(companyId) : await currentCompanyId();
@@ -440,6 +484,7 @@ async function listOrders(platform, marketplaceOrderId) {
   const pool = await poolPromise;
   const request = pool.request();
 
+  const one = Boolean(marketplaceOrderId);
   let query = `
     SELECT
       o.Id,
@@ -450,6 +495,8 @@ async function listOrders(platform, marketplaceOrderId) {
       o.MarketplaceOrderId,
       o.CustomerName,
       o.CustomerPhone,
+      o.CustomerEmail,
+      o.TrackingNo,
       o.ShippingAddress,
       o.OrderDate,
       o.OrderStatus,
@@ -464,7 +511,11 @@ async function listOrders(platform, marketplaceOrderId) {
       o.SyncStatus,
       o.SapDocNum,
       o.LastSyncedAt,
-      o.ItemsJson
+      CASE
+        WHEN ISJSON(o.ItemsJson) = 1 THEN (SELECT COUNT(*) FROM OPENJSON(o.ItemsJson))
+        ELSE 0
+      END AS ItemCount,
+      ${one ? "o.ItemsJson" : "CAST(NULL AS NVARCHAR(MAX)) AS ItemsJson"}
     FROM dbo.MarketplaceOrder o
     INNER JOIN dbo.MarketplaceConnection c
       ON c.Platform = o.Platform
@@ -492,8 +543,15 @@ async function listOrders(platform, marketplaceOrderId) {
 
   const result = await request.query(query);
   done(`rows=${result.recordset.length}`);
+  let links = new Map();
+  try {
+    links = await transferStore.linksForOrders(companyId);
+  } catch (error) {
+    console.error(error);
+  }
+  const rank = { success: 3, pending: 2, failed: 1 };
   return result.recordset.map((order) => {
-    const { ItemsJson, ...rest } = order;
+    const { ItemsJson, ItemCount, ...rest } = order;
     const lines = parseLines(ItemsJson);
     const amounts = presentAmounts(order, lines);
     const shippingStatus = mapShippingStatus(order.PlatformStatus);
@@ -501,13 +559,31 @@ async function listOrders(platform, marketplaceOrderId) {
     const orderStatus = order.PlatformStatus
       ? mapOrderStatus(order.PlatformStatus)
       : order.OrderStatus;
+    const keys = [
+      order.MarketplaceOrderId,
+      order.SapDocNum,
+      order.SapDocNum ? `SO-${order.SapDocNum}` : "",
+    ];
+    let link = null;
+    for (const key of keys) {
+      const row = key ? links.get(String(key)) : null;
+      if (row && (!link || (rank[row.status] || 0) > (rank[link.status] || 0))) link = row;
+    }
+    const itemCount = lines.length || Number(ItemCount) || 0;
     return {
       ...rest,
-      OrderDate: storedClock(order.OrderDate),
+      OrderDate: storedClock(order.OrderDate, 7 * 60 * 60 * 1000),
       LastSyncedAt: storedClock(order.LastSyncedAt),
       OrderStatus: orderStatus,
       orderStatus,
       lines,
+      ...(one ? { Lines: lines, Items: lines, items: lines } : {}),
+      itemCount,
+      ItemCount: itemCount,
+      transferStatus: link ? link.status : "",
+      TransferStatus: link ? link.status : "",
+      transferDocNum: link ? link.docNum : "",
+      TransferDocNum: link ? link.docNum : "",
       shippingStatus,
       ShippingStatus: shippingStatus,
       shippingCarrier,
@@ -532,8 +608,17 @@ async function listOrdersForSap() {
       CompanyId,
       ShopId,
       MarketplaceOrderId,
+      CustomerName,
+      CustomerPhone,
+      CustomerEmail,
+      TrackingNo,
+      ShippingAddress,
+      PaymentMethod,
+      ShippingMethod,
+      ShopName,
       OrderDate,
       OrderStatus,
+      PlatformStatus,
       ItemsJson
     FROM dbo.MarketplaceOrder
     WHERE ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
@@ -547,8 +632,17 @@ async function listOrdersForSap() {
     companyId: row.CompanyId,
     shopId: row.ShopId,
     marketplaceOrderId: row.MarketplaceOrderId,
+    customerName: row.CustomerName,
+    customerPhone: row.CustomerPhone,
+    email: row.CustomerEmail,
+    trackingNo: row.TrackingNo,
+    shippingAddress: row.ShippingAddress,
+    paymentMethod: row.PaymentMethod,
+    shippingMethod: row.ShippingMethod,
+    shopName: row.ShopName,
     orderDate: row.OrderDate,
     orderStatus: row.OrderStatus,
+    platformStatus: row.PlatformStatus,
     lines: parseLines(row.ItemsJson),
   }));
 }
@@ -558,6 +652,8 @@ module.exports = {
   upsertOrders,
   claimSapSend,
   setSapDoc,
+  setDeliveryDoc,
+  setReturnRequestDoc,
   listOrders,
   listOrdersForSap,
 };

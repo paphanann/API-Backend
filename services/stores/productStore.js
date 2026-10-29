@@ -3,6 +3,14 @@ const { clipText } = require("../../utils/normalize");
 const { ensureSchema } = require("./schema");
 const { currentCompanyId } = require("./companyContext");
 
+function storedClock(value) {
+  if (value == null || value === "") return value;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+}
+
 function variantsJson(product) {
   const list = Array.isArray(product.variants) ? product.variants : [];
   return list.length ? JSON.stringify(list) : null;
@@ -243,6 +251,8 @@ async function listProducts(platform, shopId) {
     const { VariantsJson, ...rest } = row;
     return {
       ...rest,
+      SyncedAt: storedClock(row.SyncedAt),
+      UpdatedAt: storedClock(row.UpdatedAt),
       Variants: variants,
       variants,
     };

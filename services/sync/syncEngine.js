@@ -75,15 +75,39 @@ async function pushToSap(order) {
   }
 }
 
+const SAP_SO_STATUSES = new Set(["ready_to_ship", "on_hold", "pending", "cancelled", "canceled"]);
+
+function platformStatusKey(order) {
+  return String(order.platformStatus || order.PlatformStatus || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+}
+
+function allowsSalesOrder(order) {
+  return SAP_SO_STATUSES.has(platformStatusKey(order));
+}
+
+const DELIVERY_STATUSES = new Set(["shipped", "in_transit"]);
+
+function allowsDelivery(order) {
+  return DELIVERY_STATUSES.has(platformStatusKey(order));
+}
+
+const RETURN_REQUEST_STATUSES = new Set(["to_return", "returned", "จัดส่งไม่สำเร็จ"]);
+
+function allowsReturnRequest(order) {
+  return RETURN_REQUEST_STATUSES.has(platformStatusKey(order));
+}
+
 function shouldCreateSalesOrder(order, result) {
-  const change = result && result.change;
-  if (change !== "inserted" && change !== "updated") {
-    return false;
-  }
+  if (!allowsSalesOrder(order)) return false;
   const status = String((result && result.syncStatus) || "").toLowerCase();
   if (result && result.sapDocNum) return false;
   if (status === "sap_ok" || status === "history") return false;
-  return true;
+  if (status === "sap_error") return true;
+  const change = result && result.change;
+  return change === "inserted" || change === "updated";
 }
 
 function sapDetailMessage(sap, change) {
@@ -246,35 +270,84 @@ async function syncConnectedShop(platform, connection, options = {}) {
             nextUnchanged += 1;
           }
 
-          // ใบ SO ออกตอนมีออเดอร์ ไม่รอส่งของหรือเก็บเงิน
+          // สร้าง SO เมื่อสถานะเป็น READY_TO_SHIP, ON_HOLD, pending หรือ CANCELLED
           if (!shouldCreateSalesOrder(order, result)) {
-            continue;
+            if (result.sapDocNum && sapService.orderIsCancelled(order)) {
+              try {
+                await sapService.cancelSalesOrder(order);
+              } catch (error) {
+                console.warn(`SAP cancel ${order.marketplaceOrderId}:`, error.message);
+              }
+            } else if (result.sapDocNum && result.change === "updated") {
+              try {
+                await sapService.patchSalesOrderFields({ ...order, sapDocNum: result.sapDocNum });
+              } catch (error) {
+                console.warn(`SAP header ${order.marketplaceOrderId}:`, error.message);
+              }
+            }
+          } else {
+            order.lines = (order.lines || []).map((line) => {
+              const codes = (sapIndex && sapIndex.get(String(line.sku || "").trim())) || [];
+              return {
+                ...line,
+                sapItemCode: codes.length === 1 ? codes[0] : null,
+                sapAmbiguous: codes.length > 1,
+              };
+            });
+
+            const sap = await pushToSap(order);
+            if (sap.status === "ok") {
+              nextSapOk += 1;
+              result.sapDocNum = result.sapDocNum || sap.docNum || result.sapDocNum;
+            } else if (sap.status === "error") {
+              nextSapError += 1;
+              await syncLogStore.writeDetail({
+                connectionId: connection.id,
+                platform,
+                parentSyncRunId: syncRunId,
+                status: "error",
+                message: sapDetailMessage(sap, result.change),
+                errorMessage: sap.message || null,
+                marketplaceOrderId: order.marketplaceOrderId,
+                sapDocNum: sap.docNum || null,
+              });
+            }
           }
 
-          order.lines = (order.lines || []).map((line) => {
-            const codes = (sapIndex && sapIndex.get(String(line.sku || "").trim())) || [];
-            return {
-              ...line,
-              sapItemCode: codes.length === 1 ? codes[0] : null,
-              sapAmbiguous: codes.length > 1,
-            };
-          });
+          if (allowsDelivery(order) && result.sapDocNum && !result.deliveryDocNum && !sapService.orderIsCancelled(order)) {
+            try {
+              const deliveryNum = await sapService.createDelivery(order);
+              if (deliveryNum) {
+                await orderStore.setDeliveryDoc(
+                  order.platform,
+                  order.marketplaceOrderId,
+                  deliveryNum,
+                  order.shopId,
+                  order.companyId
+                );
+                result.deliveryDocNum = deliveryNum;
+              }
+            } catch (error) {
+              console.warn(`SAP delivery ${order.marketplaceOrderId}:`, error.message);
+            }
+          }
 
-          const sap = await pushToSap(order);
-          if (sap.status === "ok") {
-            nextSapOk += 1;
-          } else if (sap.status === "error") {
-            nextSapError += 1;
-            await syncLogStore.writeDetail({
-              connectionId: connection.id,
-              platform,
-              parentSyncRunId: syncRunId,
-              status: "error",
-              message: sapDetailMessage(sap, result.change),
-              errorMessage: sap.message || null,
-              marketplaceOrderId: order.marketplaceOrderId,
-              sapDocNum: sap.docNum || null,
-            });
+          if (allowsReturnRequest(order) && !result.returnRequestDocNum) {
+            try {
+              const returnNum = await sapService.createReturnRequest(order);
+              if (returnNum) {
+                await orderStore.setReturnRequestDoc(
+                  order.platform,
+                  order.marketplaceOrderId,
+                  returnNum,
+                  order.shopId,
+                  order.companyId
+                );
+                result.returnRequestDocNum = returnNum;
+              }
+            } catch (error) {
+              console.warn(`SAP return request ${order.marketplaceOrderId}:`, error.message);
+            }
           }
         }
 
@@ -309,10 +382,6 @@ async function syncConnectedShop(platform, connection, options = {}) {
 
         if (sapService.isConfigured() && keptIds.length) {
           try {
-            const pushed = await sapService.pushProducts(
-              products.filter((product) => product && keptIds.includes(String(product.productId)))
-            );
-            console.log(`SAP OITM ${platform}: saved ${pushed.saved} failed ${pushed.failed}`);
             await sapService.mapStoredProducts(platform);
           } catch (error) {
             console.error(`SAP item map failed for ${platform}:`, error.message);
@@ -501,6 +570,7 @@ async function postStoredSalesOrders(options = {}) {
       };
     });
 
+    if (!allowsSalesOrder(order)) continue;
     const sap = await pushToSap(order);
     if (sap.status === "ok") {
       ok += 1;
@@ -519,9 +589,41 @@ async function postStoredSalesOrders(options = {}) {
   return { total: orders.length, pending: pending.length, ok, failed, errors };
 }
 
+async function resendSalesOrder(row) {
+  if (row && row.SapDocNum) {
+    return { status: "ok", docNum: String(row.SapDocNum), existed: true };
+  }
+  const order = {
+    platform: row.Platform || row.platform,
+    companyId: row.CompanyId || row.companyId,
+    shopId: row.ShopId || row.shopId,
+    shopName: row.ShopName || row.shopName,
+    marketplaceOrderId: row.MarketplaceOrderId || row.marketplaceOrderId,
+    customerName: row.CustomerName || row.customerName,
+    customerPhone: row.CustomerPhone || row.customerPhone,
+    email: row.CustomerEmail || row.customerEmail || row.email,
+    trackingNo: row.TrackingNo || row.trackingNo,
+    shippingAddress: row.ShippingAddress || row.shippingAddress,
+    orderDate: row.OrderDate || row.orderDate,
+    orderStatus: row.OrderStatus || row.orderStatus,
+    platformStatus: row.PlatformStatus || row.platformStatus,
+    paymentMethod: row.PaymentMethod || row.paymentMethod,
+    shippingMethod: row.ShippingMethod || row.shippingMethod,
+    lines: row.lines || [],
+  };
+  if (!allowsSalesOrder(order)) {
+    return {
+      status: "error",
+      message: "สร้าง Sales Order ได้เมื่อสถานะเป็น READY_TO_SHIP, ON_HOLD, pending หรือ CANCELLED",
+    };
+  }
+  return pushToSap(order);
+}
+
 module.exports = {
   syncPlatform,
   postStoredSalesOrders,
+  resendSalesOrder,
   syncAllConnected: async () => {
     const { syncAllConnected } = require("./orderSyncJob");
     return syncAllConnected();

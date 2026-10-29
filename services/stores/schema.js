@@ -58,6 +58,14 @@ async function ensureSchema() {
         ALTER TABLE dbo.MarketplaceOrder ADD PlatformStatus NVARCHAR(80) NULL;
       IF COL_LENGTH('dbo.MarketplaceOrder', 'ShopName') IS NULL
         ALTER TABLE dbo.MarketplaceOrder ADD ShopName NVARCHAR(255) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'CustomerEmail') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD CustomerEmail NVARCHAR(120) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'TrackingNo') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD TrackingNo NVARCHAR(50) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'DeliveryDocNum') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD DeliveryDocNum NVARCHAR(50) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'ReturnRequestDocNum') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD ReturnRequestDocNum NVARCHAR(50) NULL;
     END
 
     IF OBJECT_ID(N'dbo.MarketplaceOrder', N'U') IS NOT NULL
@@ -408,6 +416,56 @@ async function ensureSchema() {
       CREATE UNIQUE INDEX UX_MarketplaceProduct_Company_Platform_Shop_Product
         ON dbo.MarketplaceProduct (CompanyId, Platform, ShopId, ProductId)
         WHERE CompanyId IS NOT NULL AND ShopId IS NOT NULL AND ProductId IS NOT NULL;
+
+    IF COL_LENGTH('dbo.MarketplaceConnection', 'WarehouseCode') IS NULL
+      ALTER TABLE dbo.MarketplaceConnection ADD WarehouseCode NVARCHAR(50) NULL;
+
+    IF OBJECT_ID(N'dbo.StockTransfer', N'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.StockTransfer
+      (
+        Id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        CompanyId NVARCHAR(100) NULL,
+        DocumentNo NVARCHAR(100) NOT NULL,
+        Platform NVARCHAR(50) NULL,
+        FromWarehouse NVARCHAR(50) NOT NULL,
+        ToWarehouse NVARCHAR(50) NOT NULL,
+        Status NVARCHAR(20) NOT NULL,
+        SapDocNum NVARCHAR(50) NULL,
+        SapDocEntry NVARCHAR(50) NULL,
+        RequestedBy NVARCHAR(100) NULL,
+        Note NVARCHAR(254) NULL,
+        ReferenceNo NVARCHAR(254) NULL,
+        NumAtCard NVARCHAR(100) NULL,
+        DueDate DATETIME NULL,
+        ErrorMessage NVARCHAR(500) NULL,
+        CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_StockTransfer_CreatedAt DEFAULT GETDATE(),
+        UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_StockTransfer_UpdatedAt DEFAULT GETDATE()
+      );
+    END
+
+    IF OBJECT_ID(N'dbo.StockTransferLine', N'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.StockTransferLine
+      (
+        Id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        TransferId INT NOT NULL,
+        Sku NVARCHAR(100) NOT NULL,
+        SapItemCode NVARCHAR(50) NULL,
+        Qty DECIMAL(18, 4) NOT NULL,
+        Name NVARCHAR(255) NULL
+      );
+    END
+
+    IF OBJECT_ID(N'dbo.StockTransferOrder', N'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.StockTransferOrder
+      (
+        Id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        TransferId INT NOT NULL,
+        SalesOrderId NVARCHAR(100) NOT NULL
+      );
+    END
   `);
 
   await repairConnectionExpiries(pool);

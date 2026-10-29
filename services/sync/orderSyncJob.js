@@ -28,6 +28,8 @@ const jobs = new Map();
 const stickyBackoff = new Map();
 
 function intervalMs() {
+  const minutes = Number(process.env.ORDER_SYNC_INTERVAL_MINUTES);
+  if (Number.isFinite(minutes) && minutes >= 1) return minutes * 60 * 1000;
   const raw = Number(process.env.ORDER_SYNC_INTERVAL_MS || DEFAULT_INTERVAL_MS);
   return Number.isFinite(raw) && raw >= 60_000 ? raw : DEFAULT_INTERVAL_MS;
 }

@@ -7,12 +7,14 @@ const PLATFORM_CARD_ENV = {
   Shopee: "SAP_CARD_CODE_SHOPEE",
   TikTok: "SAP_CARD_CODE_TIKTOK",
   Lazada: "SAP_CARD_CODE_LAZADA",
+  "My Order": "SAP_CARD_CODE_MYORDER",
 };
 
 const PLATFORM_CARD_DEFAULT = {
-  Shopee: "SHOPEE",
-  TikTok: "TIKTOK",
-  Lazada: "LAZADA",
+  TikTok: "CEC00001",
+  Shopee: "CEC00002",
+  Lazada: "CEC00003",
+  "My Order": "CEC00004",
 };
 
 function getConfig() {
@@ -206,6 +208,7 @@ let masterCache = { at: 0, items: null };
 
 function clearMasterCache() {
   masterCache = { at: 0, items: null };
+  catalogCache = { at: 0, map: null };
 }
 
 async function listMasterItems() {
@@ -430,73 +433,110 @@ function describeSapMatch(sapItemCode) {
   };
 }
 
-function resolveSapItemCode(index, { sku, label, name }) {
+let catalogCache = { at: 0, map: null };
+
+function catalogCards() {
+  const cards = new Set(Object.values(PLATFORM_CARD_DEFAULT));
+  for (const platform of Object.keys(PLATFORM_CARD_DEFAULT)) {
+    const code = cardCodeFor(platform);
+    if (code) cards.add(code);
+  }
+  return [...cards];
+}
+
+async function fetchCatalogRows() {
+  const filter = catalogCards().map((code) => `CardCode eq '${odataString(code)}'`).join(" or ");
+  const rows = [];
+  let path = "/AlternateCatNum";
+  let params = { $select: "ItemCode,CardCode,Substitute", $filter: filter };
+
+  while (path) {
+    const data = await sapCall("GET", path, { params });
+    for (const row of (data && data.value) || []) rows.push(row);
+    const next = data && (data["odata.nextLink"] || data["@odata.nextLink"]);
+    if (!next) break;
+    path = String(next).replace(/^https?:\/\/[^/]+\/b1s\/v\d+/i, "");
+    params = undefined;
+  }
+  return rows;
+}
+
+async function catalogIndex() {
+  if (catalogCache.map && Date.now() - catalogCache.at < 10 * 60 * 1000) {
+    return catalogCache.map;
+  }
+  const map = new Map();
+  for (const row of await fetchCatalogRows()) {
+    const card = String(row.CardCode || "").trim();
+    const sku = String(row.Substitute || "").trim();
+    const itemCode = String(row.ItemCode || "").trim();
+    if (!card || !sku || !itemCode) continue;
+    const key = `${card}\0${sku}`;
+    const list = map.get(key) || [];
+    if (!list.includes(itemCode)) list.push(itemCode);
+    map.set(key, list);
+  }
+
+  catalogCache = { at: Date.now(), map };
+  return map;
+}
+
+function platformFromForeign(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "tiktok") return "TikTok";
+  if (raw === "shopee") return "Shopee";
+  if (raw === "lazada") return "Lazada";
+  return "";
+}
+
+function catalogHits(map, platform, sku) {
+  // ItemCode จาก OSCN ที่ CardCode ของแพลตฟอร์ม และ Substitute เท่ากับ SKU
+  const card = cardCodeFor(platform);
   const code = String(sku || "").trim();
+  if (!card || !code || code === "-") return [];
+  return map.get(`${card}\0${code}`) || [];
+}
 
-  const inventoryByLabel = () => {
-    for (const value of [label, name]) {
-      if (!value) continue;
-      const found = resolveByName(index, value, { inventoryOnly: true });
-      if (found) return found;
-    }
-    return null;
-  };
+function lookupSku(sku, fallback) {
+  const code = String(sku || "").trim();
+  if (code && code !== "-") return code;
+  const parent = String(fallback || "").trim();
+  return parent && parent !== "-" ? parent : "";
+}
 
-  // 1) U_Itemcode_api / Itemcode_Web → รับเฉพาะ inventory จริง
-  if (code && index.byApi.has(code)) {
-    const hit = pickBestMeta(
-      (index.byApi.get(code) || []).filter((m) => m.inventory && !m.placeholder)
-    );
-    if (hit) return hit.code;
+function catalogMissMessage(platform, sku, match) {
+  const card = cardCodeFor(platform) || platform || "";
+  const code = String(sku || "").trim() || "-";
+  if (match && match.problem && /มากกว่า 1/.test(match.problem)) {
+    return `SKU ${code} ตรงกับรหัสสินค้าใน OSCN มากกว่า 1 รายการ ของ ${card}`;
   }
+  return `SKU ${code} ยังไม่ได้ผูกใน OSCN ของ ${card}`;
+}
 
-  // 2) ItemCode ตรง SKU → รับเฉพาะ inventory จริง
-  //    (ห้ามใช้รหัส placeholder ของ Shopee/TikTok/Lazada ที่ระบบสร้างค้างไว้)
-  if (code && index.byCode.has(code)) {
-    const meta = index.byCode.get(code);
-    if (meta.inventory && !meta.placeholder) return meta.code;
+async function matchFromCatalog(map, platform, sku) {
+  const hits = catalogHits(map, platform, sku);
+  if (hits.length > 1) {
+    return {
+      sapItemCode: null,
+      problem: `SKU ${sku} ตรงกับรหัสสินค้าใน OSCN มากกว่า 1 รายการ`,
+      statusProblem: "ตรงกับรหัสสินค้าใน OSCN มากกว่า 1 รายการ",
+    };
   }
-
-  // 3) ชื่อตัวเลือก / ชื่อสินค้า → inventory เท่านั้น
-  const byName = inventoryByLabel();
-  if (byName) return byName;
-
-  // ไม่พบสินค้า inventory ใน SAP = Not Mapped
-  return null;
+  return describeSapMatch(hits[0] || null);
 }
 
 async function mapProduct(product) {
-  const index = buildMasterIndex(await listMasterItems());
-  const variants = (product.variants || []).map((variant) => {
-    const option = String(variant.option || "").trim();
-    const optionLabel =
-      option && !["active", "inactive", "-", "null"].includes(option.toLowerCase())
-        ? option
-        : "";
-    // ถ้า option เป็นแค่ SKU/รหัสร้าน อย่าเอาไปเทียบชื่อ — ใช้ชื่อสินค้าหลักแทน
-    const optionIsCodeLike =
-      !optionLabel ||
-      matchKey(optionLabel) === matchKey(variant.sku) ||
-      matchKey(optionLabel) === matchKey(product.sku);
-    return {
+  const catalog = await catalogIndex();
+  const variants = await Promise.all(
+    (product.variants || []).map(async (variant) => ({
       ...variant,
-      ...describeSapMatch(
-        resolveSapItemCode(index, {
-          sku: variant.sku,
-          label: optionIsCodeLike ? null : optionLabel,
-          name: product.name,
-        })
-      ),
-    };
-  });
+      ...(await matchFromCatalog(catalog, product.platform, lookupSku(variant.sku, product.sku))),
+    }))
+  );
 
   let sapItemCode = null;
   if (!variants.length) {
-    sapItemCode = resolveSapItemCode(index, {
-      sku: product.sku,
-      label: product.name,
-      name: product.name,
-    });
+    sapItemCode = (await matchFromCatalog(catalog, product.platform, lookupSku(product.sku))).sapItemCode;
   } else {
     const codes = [...new Set(variants.map((variant) => variant.sapItemCode).filter(Boolean))];
     if (codes.length === 1 && variants.every((variant) => variant.sapItemCode)) {
@@ -522,23 +562,8 @@ async function mapProduct(product) {
   };
 }
 
-async function pushProducts(products) {
-  if (!isConfigured()) return { saved: 0, failed: 0 };
-  let saved = 0;
-  let failed = 0;
-  for (const product of products || []) {
-    for (const item of collectProductItems(product)) {
-      try {
-        const code = await upsertItem(item);
-        if (code) saved += 1;
-      } catch (error) {
-        failed += 1;
-        console.warn(`SAP OITM ${item.itemCode}:`, error.message);
-      }
-    }
-  }
-  if (saved) clearMasterCache();
-  return { saved, failed };
+async function pushProducts() {
+  return { saved: 0, failed: 0 };
 }
 
 async function pushStoredProducts(platform) {
@@ -625,7 +650,12 @@ async function findSalesOrder(order) {
 }
 
 function orderIsCancelled(order) {
-  const status = String((order && (order.orderStatus || order.OrderStatus)) || "").toLowerCase();
+  const status = String(
+    (order && (order.platformStatus || order.PlatformStatus || order.orderStatus || order.OrderStatus)) || ""
+  )
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
   return status === "cancelled" || status === "canceled";
 }
 
@@ -659,8 +689,146 @@ async function cancelSalesOrder(order) {
   return String(row.DocNum || row.DocEntry);
 }
 
+async function findDelivery(order) {
+  const cardCode = cardCodeFor(order.platform);
+  const orderNo = String(order.marketplaceOrderId || "").trim();
+  if (!cardCode || !orderNo) return null;
+  const data = await sapCall("GET", "/DeliveryNotes", {
+    params: {
+      $select: "DocNum,DocEntry,Cancelled",
+      $filter: `NumAtCard eq '${odataString(orderNo)}' and CardCode eq '${odataString(cardCode)}'`,
+      $top: 5,
+    },
+  });
+  const rows = (data && data.value) || [];
+  const row = rows.find((item) => String(item.Cancelled || "").toUpperCase() !== "TYES") || null;
+  return row && (row.DocNum || row.DocEntry) ? String(row.DocNum || row.DocEntry) : null;
+}
+
+async function createDelivery(order) {
+  if (!isConfigured() || orderIsCancelled(order)) return null;
+  const existing = await findDelivery(order);
+  if (existing) return existing;
+
+  const cardCode = cardCodeFor(order.platform);
+  const orderNo = String(order.marketplaceOrderId || "").trim();
+  if (!cardCode || !orderNo) return null;
+
+  const data = await sapCall("GET", "/Orders", {
+    params: {
+      $select: "DocNum,DocEntry,Cancelled,DocumentStatus,DocumentLines",
+      $filter: `NumAtCard eq '${odataString(orderNo)}' and CardCode eq '${odataString(cardCode)}'`,
+      $top: 5,
+    },
+  });
+  const orders = ((data && data.value) || []).filter(
+    (item) => String(item.Cancelled || "").toUpperCase() !== "TYES"
+  );
+  const source = orders.find((item) => String(item.DocumentStatus || "") === "bost_Open") || orders[0];
+  if (!source || source.DocEntry == null) return null;
+
+  const lines = (source.DocumentLines || [])
+    .map((line) => ({
+      lineNum: line.LineNum,
+      quantity: Number(line.RemainingOpenQuantity != null ? line.RemainingOpenQuantity : line.Quantity) || 0,
+    }))
+    .filter((line) => line.lineNum != null && line.quantity > 0);
+  if (!lines.length) return findDelivery(order);
+
+  const payload = {
+    CardCode: cardCode,
+    NumAtCard: orderNo.slice(0, 100),
+    Comments: [order.platform, orderNo].filter(Boolean).join(" ").slice(0, 254),
+    ...(await ensureMarketplaceFields(order)),
+    DocumentLines: lines.map((line) => ({
+      BaseType: 17,
+      BaseEntry: source.DocEntry,
+      BaseLine: line.lineNum,
+      Quantity: line.quantity,
+    })),
+  };
+
+  const posted = await sapCall("POST", "/DeliveryNotes", { body: payload });
+  const docNum = posted && (posted.DocNum || posted.DocEntry);
+  return docNum ? String(docNum) : findDelivery(order);
+}
+
+async function findReturnRequest(order) {
+  const cardCode = cardCodeFor(order.platform);
+  const orderNo = String(order.marketplaceOrderId || "").trim();
+  if (!cardCode || !orderNo) return null;
+  const data = await sapCall("GET", "/ReturnRequest", {
+    params: {
+      $select: "DocNum,DocEntry,Cancelled",
+      $filter: `NumAtCard eq '${odataString(orderNo)}' and CardCode eq '${odataString(cardCode)}'`,
+      $top: 5,
+    },
+  });
+  const rows = (data && data.value) || [];
+  const row = rows.find((item) => String(item.Cancelled || "").toUpperCase() !== "TYES") || null;
+  return row && (row.DocNum || row.DocEntry) ? String(row.DocNum || row.DocEntry) : null;
+}
+
+async function loadBaseDocument(path, order) {
+  const cardCode = cardCodeFor(order.platform);
+  const orderNo = String(order.marketplaceOrderId || "").trim();
+  if (!cardCode || !orderNo) return null;
+  const data = await sapCall("GET", path, {
+    params: {
+      $select: "DocNum,DocEntry,Cancelled,DocumentStatus,DocumentLines",
+      $filter: `NumAtCard eq '${odataString(orderNo)}' and CardCode eq '${odataString(cardCode)}'`,
+      $top: 5,
+    },
+  });
+  const rows = ((data && data.value) || []).filter(
+    (item) => String(item.Cancelled || "").toUpperCase() !== "TYES"
+  );
+  return rows.find((item) => String(item.DocumentStatus || "") === "bost_Open") || rows[0] || null;
+}
+
+function copyLines(source) {
+  return (source.DocumentLines || [])
+    .map((line) => ({
+      lineNum: line.LineNum,
+      quantity: Number(line.Quantity) || Number(line.RemainingOpenQuantity) || 0,
+    }))
+    .filter((line) => line.lineNum != null && line.quantity > 0);
+}
+
+async function createReturnRequest(order) {
+  if (!isConfigured()) return null;
+  const existing = await findReturnRequest(order);
+  if (existing) return existing;
+
+  const cardCode = cardCodeFor(order.platform);
+  const orderNo = String(order.marketplaceOrderId || "").trim();
+  if (!cardCode || !orderNo) return null;
+
+  const delivery = await loadBaseDocument("/DeliveryNotes", order);
+  const source = delivery || (await loadBaseDocument("/Orders", order));
+  if (!source || source.DocEntry == null) return null;
+  const lines = copyLines(source);
+  if (!lines.length) return null;
+
+  const payload = {
+    CardCode: cardCode,
+    NumAtCard: orderNo.slice(0, 100),
+    Comments: [order.platform, orderNo].filter(Boolean).join(" ").slice(0, 254),
+    ...(await ensureMarketplaceFields(order)),
+    DocumentLines: lines.map((line) => ({
+      BaseType: delivery ? 15 : 17,
+      BaseEntry: source.DocEntry,
+      BaseLine: line.lineNum,
+      Quantity: line.quantity,
+    })),
+  };
+
+  const posted = await sapCall("POST", "/ReturnRequest", { body: payload });
+  const docNum = posted && (posted.DocNum || posted.DocEntry);
+  return docNum ? String(docNum) : findReturnRequest(order);
+}
+
 const readyCustomers = new Set();
-let knownItemCodes = null;
 
 function sapDocDate(value) {
   if (!value) return null;
@@ -687,15 +855,7 @@ async function ensureCustomer(platform) {
   }
 
   if (!existing) {
-    await sapCall("POST", "/BusinessPartners", {
-      body: {
-        CardCode: cardCode,
-        CardName: platform || cardCode,
-        CardType: "cCustomer",
-        GroupCode: 100,
-        Currency: "THB",
-      },
-    });
+    throw new Error(`ไม่พบรหัสลูกค้า ${cardCode} ใน SAP`);
   }
 
   readyCustomers.add(cardCode);
@@ -703,30 +863,302 @@ async function ensureCustomer(platform) {
 }
 
 async function lineItemCode(line, platform) {
-  if (line.sapAmbiguous) {
-    throw new Error(`SKU ${line.sku || "-"} ตรงกับรหัสสินค้าใน SAP มากกว่า 1 รายการ`);
-  }
-
-  const mapped = String(line.sapItemCode || "").trim();
-  if (mapped) return mapped;
-
-  const sku = String(line.sku || "").trim().slice(0, 50);
+  const sku = lookupSku(line && line.sku);
   if (!sku) return null;
+  const match = await matchFromCatalog(await catalogIndex(), platform, sku);
+  if (match.sapItemCode) return match.sapItemCode;
+  throw new Error(catalogMissMessage(platform, sku, match));
+}
 
-  if (!knownItemCodes) {
-    knownItemCodes = new Set(
-      (await listMasterItems()).map((item) => String(item.ItemCode || "").trim()).filter(Boolean)
-    );
+async function resolveSalesOrderLines(order) {
+  const lines = (order.lines || []).filter((line) => text(line.sku));
+  const catalog = await catalogIndex();
+  const errors = [];
+  const resolved = [];
+  const seenErrors = new Set();
+
+  for (const line of lines) {
+    const sku = lookupSku(line.sku);
+    const match = await matchFromCatalog(catalog, order.platform, sku);
+    if (!match.sapItemCode) {
+      const message = catalogMissMessage(order.platform, sku, match);
+      if (!seenErrors.has(message)) {
+        seenErrors.add(message);
+        errors.push(message);
+      }
+      continue;
+    }
+    resolved.push({ line, itemCode: match.sapItemCode });
   }
-  if (knownItemCodes.has(sku)) return sku;
 
-  const created = await upsertItem({
-    itemCode: sku,
-    itemName: line.name || line.itemName || sku,
-    platform,
+  return { errors, resolved };
+}
+
+async function assignPlatformCatalogs() {
+  const items = await listMasterItems();
+  const existing = new Set();
+  for (const row of await fetchCatalogRows()) {
+    const itemCode = String(row.ItemCode || "").trim();
+    const card = String(row.CardCode || "").trim();
+    if (itemCode && card) existing.add(`${itemCode}\0${card}`);
+  }
+
+  let created = 0;
+  let skipped = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const item of items) {
+    if (!isPlatformPlaceholder(item)) continue;
+    const platform = platformFromForeign(item.ForeignName);
+    const card = cardCodeFor(platform);
+    const itemCode = String(item.ItemCode || "").trim();
+    if (!platform || !card || !itemCode) continue;
+    if (existing.has(`${itemCode}\0${card}`)) {
+      skipped += 1;
+      continue;
+    }
+
+    try {
+      await sapCall("POST", "/AlternateCatNum", {
+        body: {
+          ItemCode: itemCode,
+          CardCode: card,
+          Substitute: itemCode.slice(0, 50),
+        },
+      });
+      existing.add(`${itemCode}\0${card}`);
+      created += 1;
+    } catch (error) {
+      failed += 1;
+      if (errors.length < 8) errors.push(`${itemCode}: ${error.message}`);
+    }
+  }
+
+  clearMasterCache();
+  return { created, skipped, failed, errors };
+}
+
+async function deletePlaceholderItems() {
+  const items = await listMasterItems();
+  const targets = items.filter(isPlatformPlaceholder);
+  let deleted = 0;
+  let failed = 0;
+  const errors = [];
+  for (const item of targets) {
+    const code = String(item.ItemCode || "").trim();
+    if (!code) continue;
+    try {
+      await sapCall("DELETE", `/Items('${odataKey(code)}')`);
+      deleted += 1;
+    } catch (error) {
+      failed += 1;
+      if (errors.length < 5) errors.push(`${code}: ${error.message}`);
+    }
+  }
+  clearMasterCache();
+  return { found: targets.length, deleted, failed, errors };
+}
+
+function clipSap(value, max) {
+  const raw = text(value, "");
+  if (!raw || raw === "-") return "";
+  return raw.length <= max ? raw : raw.slice(0, max);
+}
+
+function clipEmail(value, max) {
+  const raw = text(value, "");
+  if (!raw || raw === "-") return "";
+  if (raw.length <= max) return raw;
+  const at = raw.lastIndexOf("@");
+  if (at <= 0) return raw.slice(0, max);
+  const domain = raw.slice(at);
+  if (domain.length >= max) return domain.slice(domain.length - max);
+  return raw.slice(0, max - domain.length) + domain;
+}
+
+function paymentChoice(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "-") return null;
+  const lower = raw.toLowerCase();
+  if (lower.includes("cod") || lower.includes("cash on delivery")) {
+    return { value: "COD", description: "Cash On Delivery" };
+  }
+  if (lower.includes("transfer") || lower.includes("mobile banking")) {
+    return { value: "Transfer", description: "Transfer" };
+  }
+  if (lower.includes("pay later") || lower.includes("paylater")) {
+    return { value: "PayLater", description: "PayLater" };
+  }
+  if (lower.includes("prompt")) return { value: "PromptPay", description: "PromptPay" };
+  if (lower.includes("shopee")) return { value: "ShopeePay", description: "ShopeePay" };
+  if (lower.includes("true")) return { value: "TrueMoney", description: "TrueMoney" };
+  if (lower.includes("card") || lower.includes("credit") || lower.includes("debit")) {
+    return { value: "Credit Card", description: "Credit Card" };
+  }
+  return { value: raw.slice(0, 15), description: raw.slice(0, 50) };
+}
+
+let paymentValues = null;
+
+async function loadPaymentValues() {
+  if (paymentValues) return paymentValues;
+  const data = await sapCall("GET", "/UserFieldsMD", {
+    params: { $filter: "TableName eq 'ORDR' and Name eq 'MK_Payment'" },
   });
-  if (created) knownItemCodes.add(created);
-  return created;
+  const row = ((data && data.value) || [])[0];
+  if (!row) throw new Error("ไม่พบฟิลด์ MK_Payment ใน SAP");
+  const list = Array.isArray(row.ValidValuesMD) ? row.ValidValuesMD : [];
+  paymentValues = {
+    fieldId: row.FieldID,
+    values: new Set(list.map((item) => item.Value)),
+    list,
+  };
+  return paymentValues;
+}
+
+async function ensurePaymentValue(choice) {
+  if (!choice) return null;
+  const known = await loadPaymentValues();
+  if (known.values.has(choice.value)) return choice.value;
+  const added = { Value: choice.value, Description: choice.description || choice.value };
+  await sapCall("PATCH", `/UserFieldsMD(TableName='ORDR',FieldID=${known.fieldId})`, {
+    body: { ValidValuesMD: [added] },
+  });
+  known.list = [...known.list, added];
+  known.values.add(choice.value);
+  return choice.value;
+}
+
+let emailSize = 30;
+
+async function widenEmailField() {
+  // Service Layer ยังเก็บได้แค่ 30 ตัว แม้คอลัมน์จะกว้างกว่า ส่งเกินกว่านั้นแล้วค่าจะหาย
+  emailSize = 30;
+  return emailSize;
+}
+
+const SERVICE_LEVELS = new Set([
+  "standard",
+  "standard shipping",
+  "next-day delivery",
+  "bulky shipping",
+  "dropship",
+  "dropshipping",
+]);
+
+function transportChoice(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "-") return null;
+  const lower = raw.toLowerCase();
+  if (SERVICE_LEVELS.has(lower)) return null;
+  if (lower.includes("flash")) return { value: "FLASH", description: "FLASH" };
+  if (lower.includes("kerry") || lower.includes("kex")) return { value: "KEX", description: "KEX" };
+  if (lower.includes("thailand post") || lower.includes("ไปรษณีย์") || lower.includes("ems")) {
+    return { value: "THP", description: "Thai Post" };
+  }
+  if (lower.includes("spx")) return { value: "SPX Express", description: "SPX Express" };
+  if (lower.includes("shp food")) return { value: "SHP Food", description: "SHP Food" };
+  if (lower.includes("instant")) return { value: "Instant Delivery", description: "Instant Delivery" };
+  const code = raw.slice(0, 100);
+  return { value: code, description: code };
+}
+
+let transportValues = null;
+
+async function loadTransportValues() {
+  if (transportValues) return transportValues;
+  const data = await sapCall("GET", "/UserFieldsMD", {
+    params: {
+      $filter: "TableName eq 'ORDR' and Name eq 'MK_Transport'",
+    },
+  });
+  const row = ((data && data.value) || [])[0];
+  if (!row) throw new Error("ไม่พบฟิลด์ MK_Transport ใน SAP");
+  const list = Array.isArray(row.ValidValuesMD) ? row.ValidValuesMD : [];
+  transportValues = {
+    fieldId: row.FieldID,
+    values: new Set(list.map((item) => item.Value)),
+    list,
+  };
+  return transportValues;
+}
+
+async function ensureTransportValue(choice) {
+  if (!choice) return null;
+  const known = await loadTransportValues();
+  if (known.values.has(choice.value)) return choice.value;
+  const added = { Value: choice.value, Description: choice.description || choice.value };
+  await sapCall("PATCH", `/UserFieldsMD(TableName='ORDR',FieldID=${known.fieldId})`, {
+    body: { ValidValuesMD: [added] },
+  });
+  known.list = [...known.list, added];
+  known.values.add(choice.value);
+  return choice.value;
+}
+
+function marketplaceFields(order) {
+  const fields = {};
+  const put = (key, value, max) => {
+    const next = clipSap(value, max);
+    if (next) fields[key] = next;
+  };
+  put("U_MK_OrderID", order.marketplaceOrderId || order.MarketplaceOrderId, 20);
+  put("U_MK_OrderName", order.customerName || order.CustomerName, 50);
+  put("U_MK_TaxID", order.taxId || order.TaxId, 13);
+  put("U_MK_Address", order.shippingAddress || order.ShippingAddress, 150);
+  put("U_MK_Tel", order.customerPhone || order.CustomerPhone, 15);
+  put("U_MK_TrackNo", order.trackingNo || order.trackingNumber || order.TrackingNo, 30);
+  const email = clipEmail(order.email || order.customerEmail || order.CustomerEmail, emailSize);
+  if (email) fields.U_MK_email = email;
+  put("U_MK_Remark", order.shopName || order.ShopName, 254);
+  put("U_MK_OrderChanel", order.platform || order.Platform, 15);
+  put("U_MK_Chanel", order.platform || order.Platform, 50);
+  const payment = paymentChoice(order.paymentMethod || order.PaymentMethod);
+  if (payment) fields.U_MK_Payment = payment.value;
+  const carrier = transportChoice(order.shippingCarrier || order.shippingMethod || order.ShippingMethod);
+  if (carrier) fields.U_MK_Transport = carrier.value;
+  return fields;
+}
+
+async function ensureMarketplaceFields(order) {
+  await widenEmailField();
+  const fields = marketplaceFields(order);
+  if (fields.U_MK_Transport) {
+    const carrier = transportChoice(order.shippingCarrier || order.shippingMethod || order.ShippingMethod);
+    try {
+      await ensureTransportValue(carrier);
+    } catch (error) {
+      console.warn("SAP transport value:", error.message);
+      delete fields.U_MK_Transport;
+    }
+  }
+  if (fields.U_MK_Payment) {
+    const payment = paymentChoice(order.paymentMethod || order.PaymentMethod);
+    try {
+      await ensurePaymentValue(payment);
+    } catch (error) {
+      console.warn("SAP payment value:", error.message);
+      delete fields.U_MK_Payment;
+    }
+  }
+  return fields;
+}
+
+async function patchSalesOrderFields(order) {
+  const docNum = Number(order.sapDocNum || order.SapDocNum);
+  const fields = await ensureMarketplaceFields(order);
+  if (!docNum || !Object.keys(fields).length) return;
+  const data = await sapCall("GET", "/Orders", {
+    params: {
+      $select: "DocEntry",
+      $filter: `DocNum eq ${docNum}`,
+      $top: 1,
+    },
+  });
+  const row = ((data && data.value) || [])[0];
+  if (!row || row.DocEntry == null) return;
+  await sapCall("PATCH", `/Orders(${row.DocEntry})`, { body: fields });
 }
 
 async function createSalesOrder(order) {
@@ -734,34 +1166,42 @@ async function createSalesOrder(order) {
     return null;
   }
 
-  const cardCode = await ensureCustomer(order.platform);
   const lines = (order.lines || []).filter((line) => text(line.sku));
   if (!lines.length) {
     throw new Error("ออเดอร์ไม่มีสินค้าสำหรับสร้างใน SAP");
   }
 
+  const mapped = await resolveSalesOrderLines(order);
+  if (mapped.errors.length) {
+    throw new Error(mapped.errors.join(" | "));
+  }
+
+  const cardCode = await ensureCustomer(order.platform);
   const master = buildMasterIndex(await listMasterItems());
   const documentLines = [];
-  for (const line of lines) {
-    const itemCode = await lineItemCode(line, order.platform);
-    if (!itemCode) {
-      throw new Error(`SKU ${line.sku || "-"} ยังไม่ได้ผูกกับรหัสสินค้าใน SAP`);
-    }
+  for (const entry of mapped.resolved) {
+    const { line, itemCode } = entry;
     const meta = master.byCode.get(itemCode);
+    const gross = Math.round(Number(line.price || 0) * 100) / 100;
     const row = {
       ItemCode: itemCode,
       Quantity: Number(line.qty || 1) || 1,
-      // ราคาใน marketplace เป็นยอดรวมภาษี 7% — ส่งราคาก่อนภาษี ให้ DocTotal ตรงกับยอดออเดอร์
-      UnitPrice: Math.round((Number(line.price || 0) / 1.07) * 1000000) / 1000000,
+      // ราคาจากแพลตฟอร์มเป็นยอดรวมภาษี 7% ให้ไปอยู่ Gross Price after Disc
+      PriceAfterVAT: gross,
+      UnitPrice: Math.round((gross / 1.07) * 1000000) / 1000000,
     };
-    if (meta && meta.inventory) row.WarehouseCode = "01";
+    if (meta && meta.inventory) row.WarehouseCode = "ONLINE";
     documentLines.push(row);
   }
 
-  const payload = {
+  const header = {
     CardCode: cardCode,
     NumAtCard: String(order.marketplaceOrderId).slice(0, 100),
     Comments: [order.platform, order.marketplaceOrderId].filter(Boolean).join(" ").slice(0, 254),
+    ...(await ensureMarketplaceFields(order)),
+  };
+  const payload = {
+    ...header,
     DocumentLines: documentLines,
   };
   const docDate = sapDocDate(order.orderDate || order.OrderDate);
@@ -778,9 +1218,7 @@ async function createSalesOrder(order) {
   } catch (error) {
     if (!payload.DocDate || !/period|posting date|locked/i.test(error.message || "")) throw error;
     const data = await post({
-      CardCode: payload.CardCode,
-      NumAtCard: payload.NumAtCard,
-      Comments: payload.Comments,
+      ...header,
       DocumentLines: payload.DocumentLines,
     });
     return String((data && (data.DocNum || data.DocEntry)) || "");
@@ -825,6 +1263,94 @@ function startSapMapJob() {
   }
 }
 
+async function fillOrderTransport(docNum, shippingMethod, trackingNo) {
+  const number = Number(docNum);
+  const fields = {};
+  const choice = transportChoice(shippingMethod);
+  if (choice) {
+    await ensureTransportValue(choice);
+    fields.U_MK_Transport = choice.value;
+  }
+  const track = clipSap(trackingNo, 30);
+  if (track) fields.U_MK_TrackNo = track;
+  if (!number || !Object.keys(fields).length) return false;
+  const data = await sapCall("GET", "/Orders", {
+    params: {
+      $select: "DocEntry,U_MK_Transport,U_MK_TrackNo",
+      $filter: `DocNum eq ${number}`,
+      $top: 1,
+    },
+  });
+  const row = ((data && data.value) || [])[0];
+  if (!row || row.DocEntry == null) return false;
+  if (fields.U_MK_Transport && row.U_MK_Transport === fields.U_MK_Transport) delete fields.U_MK_Transport;
+  if (fields.U_MK_TrackNo && row.U_MK_TrackNo === fields.U_MK_TrackNo) delete fields.U_MK_TrackNo;
+  if (!Object.keys(fields).length) return false;
+  await sapCall("PATCH", `/Orders(${row.DocEntry})`, { body: fields });
+  return true;
+}
+
+async function warehouseStock(itemCode, warehouseCode) {
+  const data = await sapCall("GET", `/Items('${odataKey(itemCode)}')`, {
+    params: { $select: "ItemCode,ItemWarehouseInfoCollection" },
+  });
+  const rows = (data && data.ItemWarehouseInfoCollection) || [];
+  const row = rows.find((item) => String(item.WarehouseCode || "") === warehouseCode);
+  if (!row) return 0;
+  const onHand = Number(row.InStock != null ? row.InStock : row.OnHand) || 0;
+  const committed = Number(row.Committed) || 0;
+  return onHand - committed;
+}
+
+async function mapTransferSkus(platform, items) {
+  const catalog = await catalogIndex();
+  const errors = [];
+  const mapped = [];
+  for (const item of items) {
+    const sku = lookupSku(item.sku);
+    const match = await matchFromCatalog(catalog, platform, sku);
+    if (!match.sapItemCode) {
+      errors.push(catalogMissMessage(platform, sku, match));
+      continue;
+    }
+    mapped.push({ ...item, sku, sapItemCode: match.sapItemCode });
+  }
+  return { mapped, errors };
+}
+
+async function createStockTransfer(doc) {
+  return sapCall("POST", "/StockTransfers", { body: doc });
+}
+
+async function findStockTransfer(documentNo, numAtCard) {
+  const doc = String(documentNo || "").replace(/'/g, "''");
+  if (doc) {
+    try {
+      const byComment = await sapCall("GET", "/StockTransfers", {
+        params: {
+          $select: "DocEntry,DocNum,NumAtCard,Comments",
+          $filter: `contains(Comments,'${doc}')`,
+          $top: 1,
+        },
+      });
+      const hit = byComment && Array.isArray(byComment.value) ? byComment.value[0] : null;
+      if (hit) return hit;
+    } catch (error) {
+      console.error(error);
+    }
+  }
+  const card = String(numAtCard || "").replace(/'/g, "''").slice(0, 100);
+  if (!card) return null;
+  const byCard = await sapCall("GET", "/StockTransfers", {
+    params: {
+      $select: "DocEntry,DocNum,NumAtCard",
+      $filter: `NumAtCard eq '${card}'`,
+      $top: 1,
+    },
+  });
+  return byCard && Array.isArray(byCard.value) ? byCard.value[0] || null : null;
+}
+
 module.exports = {
   isConfigured,
   login,
@@ -838,8 +1364,20 @@ module.exports = {
   listWarehouses,
   listInventoryTransferRequests,
   createInventoryTransferRequest,
+  createStockTransfer,
+  findStockTransfer,
+  warehouseStock,
+  mapTransferSkus,
   findSalesOrder,
+  deletePlaceholderItems,
+  assignPlatformCatalogs,
+  marketplaceFields,
+  transportChoice,
+  fillOrderTransport,
+  patchSalesOrderFields,
   cancelSalesOrder,
   orderIsCancelled,
   createSalesOrder,
+  createDelivery,
+  createReturnRequest,
 };

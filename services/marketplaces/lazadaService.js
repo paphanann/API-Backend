@@ -330,6 +330,24 @@ async function ensureFreshTokens(connection, options = {}) {
   }
 }
 
+function lazadaCarrier(order, items) {
+  for (const item of items) {
+    const provider = text(item && item.shipment_provider);
+    if (provider) return provider.split(",")[0].trim();
+  }
+  const kind = text(order.shipping_provider_type);
+  if (!kind || /standard|dropship/i.test(kind)) return null;
+  return kind;
+}
+
+function lazadaTracking(items) {
+  for (const item of items) {
+    const code = text(item && item.tracking_code);
+    if (code) return code;
+  }
+  return null;
+}
+
 function normalizeOrder(order) {
   const address = order.address_shipping || {};
   const items = Array.isArray(order.items) ? order.items : [];
@@ -337,7 +355,7 @@ function normalizeOrder(order) {
     sku: text(item.sku || item.shop_sku, "-"),
     name: text(item.name, "-"),
     qty: Number(item.quantity || 1),
-    price: money(item.item_price),
+    price: money(item.paid_price != null && item.paid_price !== "" ? item.paid_price : item.item_price),
   }));
   const totalAmount = money(order.price);
   const shippingKnown = order.shipping_fee != null && order.shipping_fee !== "";
@@ -375,12 +393,14 @@ function normalizeOrder(order) {
     orderStatus: mapOrderStatus(order.statuses && order.statuses[0]),
     platformStatus: text(order.statuses && order.statuses[0]),
     paymentMethod: text(order.payment_method),
-    shippingMethod: text(order.shipping_provider_type),
+    shippingMethod: lazadaCarrier(order, items),
+    trackingNo: lazadaTracking(items),
     totalAmount,
     itemAmount: amounts.itemAmount,
     discountAmount: amounts.discountAmount,
     shippingAmount: amounts.shippingAmount,
     currency: text(order.currency, "THB"),
+    email: visibleText(address.email || (order.address_billing && order.address_billing.email)),
     lines,
   };
 }

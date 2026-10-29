@@ -382,7 +382,11 @@ function normalizeOrder(detail) {
     sku: text(item.model_sku || item.item_sku || item.item_id, "-"),
     name: text(item.item_name || item.model_name, "-"),
     qty: Number(item.model_quantity_purchased || item.quantity || 1),
-    price: money(item.model_original_price || item.model_discounted_price),
+    price: money(
+      item.model_discounted_price != null && item.model_discounted_price !== ""
+        ? item.model_discounted_price
+        : item.model_original_price
+    ),
   }));
   const totalAmount = money(detail.total_amount);
   const amounts = splitOrderAmounts(lines, totalAmount, shopeeShipping(detail));
@@ -401,17 +405,41 @@ function normalizeOrder(detail) {
     platformStatus: text(detail.order_status),
     paymentMethod: text(detail.payment_method),
     shippingMethod: text(detail.shipping_carrier),
+    trackingNo: text(detail.tracking_number),
     totalAmount,
     itemAmount: amounts.itemAmount,
     discountAmount: amounts.discountAmount,
     shippingAmount: amounts.shippingAmount,
     currency: text(detail.currency, "THB"),
+    email: visibleText(
+      (detail.invoice_data && (detail.invoice_data.email || detail.invoice_data.buyer_email)) ||
+        detail.buyer_email
+    ),
     lines,
   };
 }
 
 function recipientNeedsLookup(order) {
   return !order.customerPhone || !order.shippingAddress || !order.customerName || order.customerName === "-";
+}
+
+async function attachShopeeTracking(connection, details) {
+  let blocked = false;
+  await mapPool(details, 4, async (detail) => {
+    if (blocked || !detail || !detail.order_sn || detail.tracking_number) return;
+    try {
+      const data = await shopeeRequest("GET", "/api/v2/logistics/get_tracking_number", {
+        connection,
+        query: { order_sn: detail.order_sn },
+      });
+      const tracking = data && data.response && data.response.tracking_number;
+      if (tracking) detail.tracking_number = tracking;
+    } catch (error) {
+      const message = error.message || "";
+      if (/undeclared|whitelist|403|source ip/i.test(message)) blocked = true;
+      console.warn(`Shopee tracking ${detail.order_sn}:`, message);
+    }
+  });
 }
 
 async function fillShopeeRecipient(connection, detail) {
@@ -484,13 +512,32 @@ function tierOptionLabel(tierVariation, tierIndex) {
   return parts.join(" / ");
 }
 
+function firstPriceInfo(priceInfo) {
+  if (Array.isArray(priceInfo)) return priceInfo[0] || null;
+  if (priceInfo && typeof priceInfo === "object") return priceInfo;
+  return null;
+}
+
+function shopeeUnitPrice(...candidates) {
+  for (const candidate of candidates) {
+    const row = firstPriceInfo(candidate);
+    if (!row) continue;
+    if (row.current_price !== undefined && row.current_price !== null && row.current_price !== "") {
+      return money(row.current_price);
+    }
+    if (row.original_price !== undefined && row.original_price !== null && row.original_price !== "") {
+      return money(row.original_price);
+    }
+  }
+  return null;
+}
+
 function normalizeProduct(item, modelsPayload = null) {
   const imageUrl = pickShopeeImage(item);
   const models = (modelsPayload && modelsPayload.model) || [];
   const tierVariation = (modelsPayload && modelsPayload.tier_variation) || [];
 
   const variants = models.map((model) => {
-    const priceInfo = (model.price_info && model.price_info[0]) || model.price_info || {};
     const stockInfo =
       (model.stock_info_v2 &&
         model.stock_info_v2.summary_info &&
@@ -502,18 +549,14 @@ function normalizeProduct(item, modelsPayload = null) {
       sku: text(model.model_sku, ""),
       modelId: String(model.model_id || ""),
       option: tierOptionLabel(tierVariation, model.tier_index) || text(model.model_name, ""),
-      price: money(
-        priceInfo.current_price ||
-          priceInfo.original_price ||
-          (item.price_info && item.price_info.current_price)
-      ),
+      price: shopeeUnitPrice(model.price_info, item.price_info),
       stock: Number(stockInfo || 0),
       status: mapProductStatus(item.item_status),
       imageUrl,
     };
   });
 
-  const priceFromParent = money(item.price_info && item.price_info.current_price);
+  const priceFromParent = shopeeUnitPrice(item.price_info);
   const stockFromParent = Number(
     (item.stock_info_v2 &&
       item.stock_info_v2.summary_info &&
@@ -594,13 +637,14 @@ async function fetchShopeeOrdersInWindow(connection, window, options = {}) {
       query: {
         order_sn_list: batch.join(","),
         response_optional_fields:
-          "buyer_user_name,item_list,total_amount,recipient_address,payment_method,shipping_carrier,estimated_shipping_fee,actual_shipping_fee",
+          "buyer_username,buyer_user_name,item_list,package_list,total_amount,recipient_address,payment_method,shipping_carrier,estimated_shipping_fee,actual_shipping_fee,invoice_data",
       },
     });
 
     const list = (detail.response && detail.response.order_list) || [];
     if (!options.skipDetails) {
       await attachShopeeBuyerShipping(connection, list);
+      await attachShopeeTracking(connection, list);
     }
     const filled = options.skipDetails
       ? list.map((row) => normalizeOrder(row))

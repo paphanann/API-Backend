@@ -135,15 +135,14 @@ function text(value, fallback = null) {
 
 function visibleText(value, fallback = null) {
   const trimmed = text(value, null);
-  if (!trimmed || /^[\s*]+$/.test(trimmed)) return fallback;
+  if (!trimmed) return fallback;
   return trimmed;
 }
 
 function clipText(value, max) {
   const raw = text(value, null);
   if (!raw || !max) return raw;
-  const cleaned = raw.replace(/\*{4,}/g, "").replace(/\s+/g, " ").trim();
-  const next = cleaned || raw;
+  const next = raw.replace(/\s+/g, " ").trim();
   return next.length <= max ? next : next.slice(0, max);
 }
 

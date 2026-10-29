@@ -438,13 +438,15 @@ function normalizeOrder(order) {
     orderDate: toDate(order.create_time),
     orderStatus: mapOrderStatus(order.status),
     platformStatus: text(order.status),
-    paymentMethod: text(payment.payment_method),
-    shippingMethod: text(order.delivery_option_name || order.shipping_provider),
+    paymentMethod: text(order.payment_method_name || (order.is_cod ? "COD" : payment.payment_method)),
+    shippingMethod: text(order.shipping_provider || order.delivery_option_name),
+    trackingNo: text(order.tracking_number),
     totalAmount,
     itemAmount: amounts.itemAmount,
     discountAmount: amounts.discountAmount,
     shippingAmount: amounts.shippingAmount,
     currency: text(payment.currency, "THB"),
+    email: visibleText(order.buyer_email),
     lines,
   };
 }
