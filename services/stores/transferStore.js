@@ -122,15 +122,14 @@ async function setResult(id, { status, sapDocNum, sapDocEntry, errorMessage }) {
 
 function shape(header, lines, orders) {
   const salesOrderIds = orders.map((row) => row.SalesOrderId).filter(Boolean);
-  const sapDocNum = header.SapDocNum ? String(header.SapDocNum) : "";
-  const documentNo = header.DocumentNo || "";
-    const docNo = sapDocNum || documentNo;
-  return {
-    id: docNo,
-    docNum: docNo,
-    DocNum: sapDocNum,
-    transferId: header.Id,
-    documentNo,
+    const sapDocNum = header.SapDocNum ? String(header.SapDocNum) : "";
+    const documentNo = header.DocumentNo || "";
+    return {
+      id: documentNo,
+      docNum: sapDocNum,
+      DocNum: sapDocNum,
+      transferId: header.Id,
+      documentNo,
     status: header.Status || "pending",
     fromWarehouseId: header.FromWarehouse || "",
     toWarehouseId: header.ToWarehouse || "",
@@ -175,17 +174,19 @@ async function listTransfers(companyId) {
   ]);
   const lineMap = new Map();
   for (const line of lines.recordset) {
-    const list = lineMap.get(line.TransferId) || [];
+    const key = Number(line.TransferId);
+    const list = lineMap.get(key) || [];
     list.push(line);
-    lineMap.set(line.TransferId, list);
+    lineMap.set(key, list);
   }
   const orderMap = new Map();
   for (const order of orders.recordset) {
-    const list = orderMap.get(order.TransferId) || [];
+    const key = Number(order.TransferId);
+    const list = orderMap.get(key) || [];
     list.push(order);
-    orderMap.set(order.TransferId, list);
+    orderMap.set(key, list);
   }
-  return headers.recordset.map((row) => shape(row, lineMap.get(row.Id) || [], orderMap.get(row.Id) || []));
+  return headers.recordset.map((row) => shape(row, lineMap.get(Number(row.Id)) || [], orderMap.get(Number(row.Id)) || []));
 }
 
 async function linksForOrders(companyId) {

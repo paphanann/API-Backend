@@ -1,5 +1,7 @@
 const useWindowsAuth = String(process.env.DB_AUTH || "").trim().toLowerCase() === "windows";
 const sql = useWindowsAuth ? require("mssql/msnodesqlv8") : require("mssql");
+const databaseName = process.env.DB_DATABASE || process.env.DB_NAME;
+const dbPort = Number(process.env.DB_PORT) || 1433;
 
 const poolOptions = {
   max: 10,
@@ -10,7 +12,7 @@ const poolOptions = {
 const config = useWindowsAuth
   ? {
       server: process.env.DB_SERVER,
-      database: process.env.DB_DATABASE,
+      database: databaseName,
       driver: "msnodesqlv8",
       connectionTimeout: 30000,
       requestTimeout: 30000,
@@ -24,8 +26,8 @@ const config = useWindowsAuth
       user: process.env.DB_USER,
       password: process.env.DB_PASSWORD,
       server: process.env.DB_SERVER,
-      database: process.env.DB_DATABASE,
-      port: 1433,
+      database: databaseName,
+      port: dbPort,
       connectionTimeout: 30000,
       requestTimeout: 30000,
       pool: poolOptions,

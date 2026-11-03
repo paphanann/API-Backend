@@ -262,11 +262,11 @@ router.post("/", async (req, res) => {
     });
 
     const sapDoc = {
+      CardCode: sapService.cardCodeFor(platform),
       DocDate: docDate,
       DueDate: docDate,
       FromWarehouse: fromWarehouse,
       ToWarehouse: toWarehouse,
-      Comments: text(`${documentNo} | ${note}`, 254),
       NumAtCard: numAtCard,
       StockTransferLines: storedLines.map((line) => ({
         ItemCode: line.sapItemCode,
@@ -279,11 +279,13 @@ router.post("/", async (req, res) => {
     try {
       let created;
       try {
-        created = await sapService.createStockTransfer(sapDoc);
+        created = await sapService.createInventoryTransferRequest(sapDoc);
       } catch (error) {
-        if (!/NumAtCard/i.test(String(error && error.message))) throw error;
-        const { NumAtCard, ...withoutCard } = sapDoc;
-        created = await sapService.createStockTransfer(withoutCard);
+        if (!/NumAtCard|CardCode/i.test(String(error && error.message))) throw error;
+        const { NumAtCard, CardCode, ...rest } = sapDoc;
+        created = await sapService.createInventoryTransferRequest(
+          /CardCode/i.test(String(error && error.message)) ? rest : { ...rest, CardCode }
+        );
       }
       await transferStore.setResult(transferId, {
         status: "success",
@@ -292,7 +294,7 @@ router.post("/", async (req, res) => {
         errorMessage: "",
       });
     } catch (error) {
-      const message = publicError(error, "สร้าง Stock Transfer ใน SAP ไม่สำเร็จ");
+      const message = publicError(error, "สร้าง Inventory Transfer Request ใน SAP ไม่สำเร็จ");
       if (isDelay(error)) {
         await transferStore.setResult(transferId, {
           status: "pending",

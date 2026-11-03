@@ -147,22 +147,54 @@ function clipText(value, max) {
 }
 
 function mapOrderStatus(raw) {
-  const value = String(raw || "").toLowerCase();
+  const value = String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+
+  if (!value) return "pending";
 
   if (
-    value.includes("cancel") ||
-    value.includes("void") ||
-    value.includes("in_cancel")
+    value.includes("return") ||
+    value.includes("refund") ||
+    value.includes("shipped_back") ||
+    value === "failed" ||
+    value.includes("lost") ||
+    value.includes("damaged") ||
+    value.includes("คืนสินค้า") ||
+    value.includes("คืนเงิน") ||
+    value.includes("จัดส่งไม่สำเร็จ")
   ) {
+    return "returned";
+  }
+
+  if (value.includes("cancel") || value.includes("void") || value.includes("in_cancel")) {
     return "cancelled";
   }
 
-  if (value.includes("unpaid")) {
-    return "pending";
+  if (value.includes("unpaid") || value.includes("รอชำระ")) {
+    return "unpaid";
   }
 
-  if (value.includes("complete") || value.includes("deliver")) {
+  if (
+    value === "completed" ||
+    value === "complete" ||
+    value === "delivered" ||
+    value === "confirmed" ||
+    value.includes("success") ||
+    value === "สำเร็จ"
+  ) {
     return "success";
+  }
+
+  if (
+    value === "shipped" ||
+    value === "in_transit" ||
+    value === "to_confirm_receive" ||
+    value === "partially_shipping" ||
+    value.includes("กำลังจัดส่ง")
+  ) {
+    return "shipping";
   }
 
   return "pending";

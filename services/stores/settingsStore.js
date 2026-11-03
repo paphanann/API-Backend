@@ -385,6 +385,9 @@ async function createUser(payload = {}) {
     }
     const hash = await hashPassword(input.password, 100);
     const cols = await columnSet(pool, "Users");
+    const stamps = ["CreatedAt", "UpdatedAt"].filter((name) => cols.has(name));
+    const stampCols = stamps.length ? `, ${stamps.join(", ")}` : "";
+    const stampVals = stamps.length ? `, ${stamps.map(() => "GETDATE()").join(", ")}` : "";
     const req = pool
       .request()
       .input("username", input.email)
@@ -394,13 +397,13 @@ async function createUser(payload = {}) {
     if (cols.has("Role")) {
       req.input("role", input.role);
       await req.query(`
-        INSERT INTO dbo.Users (Username, Password, FullName, IsActive, Role)
-        VALUES (@username, @password, @fullName, @isActive, @role)
+        INSERT INTO dbo.Users (Username, Password, FullName, IsActive, Role${stampCols})
+        VALUES (@username, @password, @fullName, @isActive, @role${stampVals})
       `);
     } else {
       await req.query(`
-        INSERT INTO dbo.Users (Username, Password, FullName, IsActive)
-        VALUES (@username, @password, @fullName, @isActive)
+        INSERT INTO dbo.Users (Username, Password, FullName, IsActive${stampCols})
+        VALUES (@username, @password, @fullName, @isActive${stampVals})
       `);
     }
     const users = await listUsers();
@@ -419,6 +422,9 @@ async function createUser(payload = {}) {
     }
     const hash = await hashPassword(input.password, 255);
     const cols = await columnSet(pool, "AppUser");
+    const stamps = ["CreatedAt", "UpdatedAt"].filter((name) => cols.has(name));
+    const stampCols = stamps.length ? `, ${stamps.join(", ")}` : "";
+    const stampVals = stamps.length ? `, ${stamps.map(() => "GETDATE()").join(", ")}` : "";
     const req = pool
       .request()
       .input("email", input.email)
@@ -428,13 +434,13 @@ async function createUser(payload = {}) {
     if (cols.has("Role")) {
       req.input("role", input.role);
       await req.query(`
-        INSERT INTO dbo.AppUser (Email, Username, Name, PasswordHash, Role)
-        VALUES (@email, @username, @name, @passwordHash, @role)
+        INSERT INTO dbo.AppUser (Email, Username, Name, PasswordHash, Role${stampCols})
+        VALUES (@email, @username, @name, @passwordHash, @role${stampVals})
       `);
     } else {
       await req.query(`
-        INSERT INTO dbo.AppUser (Email, Username, Name, PasswordHash)
-        VALUES (@email, @username, @name, @passwordHash)
+        INSERT INTO dbo.AppUser (Email, Username, Name, PasswordHash${stampCols})
+        VALUES (@email, @username, @name, @passwordHash${stampVals})
       `);
     }
     const users = await listUsers();

@@ -338,7 +338,19 @@ async function listInventoryTransferRequests() {
 }
 
 async function createInventoryTransferRequest(doc) {
-  return sapCall("POST", "/InventoryTransferRequests", { body: doc });
+  const body = { ...doc, Comments: "", JournalMemo: "" };
+  const created = await sapCall("POST", "/InventoryTransferRequests", { body });
+  const entry = created && created.DocEntry;
+  if (entry != null) {
+    try {
+      await sapCall("PATCH", `/InventoryTransferRequests(${entry})`, {
+        body: { Comments: "", JournalMemo: "" },
+      });
+    } catch (error) {
+      console.error(error);
+    }
+  }
+  return created;
 }
 
 async function listStockItems() {
@@ -490,7 +502,7 @@ function platformFromForeign(value) {
 }
 
 function catalogHits(map, platform, sku) {
-  // ItemCode จาก OSCN ที่ CardCode ของแพลตฟอร์ม และ Substitute เท่ากับ SKU
+  // จับจาก BP Code + BP Catalog No. เท่านั้น ไม่ได้ค้นจากรหัสสินค้า
   const card = cardCodeFor(platform);
   const code = String(sku || "").trim();
   if (!card || !code || code === "-") return [];
@@ -510,7 +522,7 @@ function catalogMissMessage(platform, sku, match) {
   if (match && match.problem && /มากกว่า 1/.test(match.problem)) {
     return `SKU ${code} ตรงกับรหัสสินค้าใน OSCN มากกว่า 1 รายการ ของ ${card}`;
   }
-  return `SKU ${code} ยังไม่ได้ผูกใน OSCN ของ ${card}`;
+  return `SKU ${code} ยังไม่ได้ผูกใน BP Catalog No. ของ ${card}`;
 }
 
 async function matchFromCatalog(map, platform, sku) {
@@ -895,48 +907,7 @@ async function resolveSalesOrderLines(order) {
 }
 
 async function assignPlatformCatalogs() {
-  const items = await listMasterItems();
-  const existing = new Set();
-  for (const row of await fetchCatalogRows()) {
-    const itemCode = String(row.ItemCode || "").trim();
-    const card = String(row.CardCode || "").trim();
-    if (itemCode && card) existing.add(`${itemCode}\0${card}`);
-  }
-
-  let created = 0;
-  let skipped = 0;
-  let failed = 0;
-  const errors = [];
-
-  for (const item of items) {
-    if (!isPlatformPlaceholder(item)) continue;
-    const platform = platformFromForeign(item.ForeignName);
-    const card = cardCodeFor(platform);
-    const itemCode = String(item.ItemCode || "").trim();
-    if (!platform || !card || !itemCode) continue;
-    if (existing.has(`${itemCode}\0${card}`)) {
-      skipped += 1;
-      continue;
-    }
-
-    try {
-      await sapCall("POST", "/AlternateCatNum", {
-        body: {
-          ItemCode: itemCode,
-          CardCode: card,
-          Substitute: itemCode.slice(0, 50),
-        },
-      });
-      existing.add(`${itemCode}\0${card}`);
-      created += 1;
-    } catch (error) {
-      failed += 1;
-      if (errors.length < 8) errors.push(`${itemCode}: ${error.message}`);
-    }
-  }
-
-  clearMasterCache();
-  return { created, skipped, failed, errors };
+  return { created: 0, skipped: 0, failed: 0, errors: [] };
 }
 
 async function deletePlaceholderItems() {
@@ -1197,7 +1168,8 @@ async function createSalesOrder(order) {
   const header = {
     CardCode: cardCode,
     NumAtCard: String(order.marketplaceOrderId).slice(0, 100),
-    Comments: [order.platform, order.marketplaceOrderId].filter(Boolean).join(" ").slice(0, 254),
+    Comments: "",
+    JournalMemo: "",
     ...(await ensureMarketplaceFields(order)),
   };
   const payload = {
@@ -1211,7 +1183,20 @@ async function createSalesOrder(order) {
     payload.TaxDate = docDate;
   }
 
-  const post = (body) => sapCall("POST", "/Orders", { body });
+  const post = async (body) => {
+    const data = await sapCall("POST", "/Orders", { body });
+    const entry = data && data.DocEntry;
+    if (entry != null) {
+      try {
+        await sapCall("PATCH", `/Orders(${entry})`, {
+          body: { Comments: "", JournalMemo: "" },
+        });
+      } catch (error) {
+        console.error(error);
+      }
+    }
+    return data;
+  };
   try {
     const data = await post(payload);
     return String((data && (data.DocNum || data.DocEntry)) || "");
@@ -1326,7 +1311,7 @@ async function findStockTransfer(documentNo, numAtCard) {
   const doc = String(documentNo || "").replace(/'/g, "''");
   if (doc) {
     try {
-      const byComment = await sapCall("GET", "/StockTransfers", {
+      const byComment = await sapCall("GET", "/InventoryTransferRequests", {
         params: {
           $select: "DocEntry,DocNum,NumAtCard,Comments",
           $filter: `contains(Comments,'${doc}')`,
@@ -1341,7 +1326,7 @@ async function findStockTransfer(documentNo, numAtCard) {
   }
   const card = String(numAtCard || "").replace(/'/g, "''").slice(0, 100);
   if (!card) return null;
-  const byCard = await sapCall("GET", "/StockTransfers", {
+  const byCard = await sapCall("GET", "/InventoryTransferRequests", {
     params: {
       $select: "DocEntry,DocNum,NumAtCard",
       $filter: `NumAtCard eq '${card}'`,
@@ -1365,6 +1350,7 @@ module.exports = {
   listInventoryTransferRequests,
   createInventoryTransferRequest,
   createStockTransfer,
+  cardCodeFor,
   findStockTransfer,
   warehouseStock,
   mapTransferSkus,

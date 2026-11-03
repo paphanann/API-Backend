@@ -26,31 +26,26 @@ const { startOrderSyncJob } = require("./services/sync/orderSyncJob");
 const { startSapMapJob } = require("./services/marketplaces/sapService");
 const dashboardRoutes = require("./routes/dashboardRoutes");
 const { poolPromise } = require("./config/database");
+const { requireAuth } = require("./middleware/requireAuth");
 const { startTimer } = require("./utils/timing");
 
 const app = express();
 app.set("trust proxy", 1);
 
-const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const allowedOrigins = [
+  "https://passmarketplace.com",
+  "https://www.passmarketplace.com",
+  ...(process.env.FRONTEND_URL || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+];
 
 function isAllowedOrigin(origin) {
-  if (!origin) {
-    return true;
-  }
-
-  if (allowedOrigins.includes(origin)) {
-    return true;
-  }
-
-  try {
-    const { hostname } = new URL(origin);
-    return hostname === "localhost" || hostname === "127.0.0.1";
-  } catch {
-    return false;
-  }
+  if (!origin) return true;
+  if (allowedOrigins.includes(origin)) return true;
+  // Flutter web สุ่มพอร์ตทุกครั้งที่รัน อนุญาตเฉพาะเครื่องนี้ ไม่เปิดให้โดเมนอื่น
+  return /^http:\/\/localhost:\d+$/.test(origin) || /^http:\/\/127\.0\.0\.1:\d+$/.test(origin);
 }
 
 app.use((req, res, next) => {
@@ -66,7 +61,11 @@ app.use((req, res, next) => {
 app.use(
   cors({
     origin(origin, callback) {
-      callback(null, isAllowedOrigin(origin));
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error("Origin not allowed by CORS"));
     },
     credentials: true,
   })
@@ -75,6 +74,7 @@ app.use(
 
 
 app.use(express.json());
+app.use(requireAuth);
 
 // ngrok free บางทีโชว์หน้าเตือนจน OAuth callback พัง — ข้ามสำหรับ path callback
 app.use((req, res, next) => {

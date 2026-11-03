@@ -3,6 +3,7 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 
 const { poolPromise, sql } = require("../config/database");
+const { signToken } = require("../middleware/requireAuth");
 
 const router = express.Router();
 
@@ -147,13 +148,14 @@ router.post("/login", async (req, res) => {
       return res.status(401).json(INVALID);
     }
 
+    const user = {
+      email: pick(row, ["Email", "Username"]) || login,
+      name: pick(row, ["FullName", "Name"]) || login,
+      role: String(pick(row, ["Role"]) || "User").trim().toLowerCase(),
+    };
     res.json({
-      token: "",
-      user: {
-        email: pick(row, ["Email", "Username"]) || login,
-        name: pick(row, ["FullName", "Name"]) || login,
-        role: String(pick(row, ["Role"]) || "User").trim().toLowerCase(),
-      },
+      token: signToken(user),
+      user,
     });
   } catch (error) {
     console.error("Login failed:", error.message);
