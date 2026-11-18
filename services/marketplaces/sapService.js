@@ -3,13 +3,6 @@ const axios = require("axios");
 
 const { text } = require("../../utils/normalize");
 
-const PLATFORM_CARD_ENV = {
-  Shopee: "SAP_CARD_CODE_SHOPEE",
-  TikTok: "SAP_CARD_CODE_TIKTOK",
-  Lazada: "SAP_CARD_CODE_LAZADA",
-  "My Order": "SAP_CARD_CODE_MYORDER",
-};
-
 const PLATFORM_CARD_DEFAULT = {
   TikTok: "CEC00001",
   Shopee: "CEC00002",
@@ -30,12 +23,35 @@ function getConfig() {
   };
 }
 
+function canonicalPlatform(platform) {
+  const raw = String(platform || "").trim().toLowerCase().replace(/\s+/g, "");
+  if (raw.includes("tiktok")) return "TikTok";
+  if (raw.includes("shopee")) return "Shopee";
+  if (raw.includes("lazada")) return "Lazada";
+  if (raw.includes("myorder")) return "My Order";
+  return "";
+}
+
 function cardCodeFor(platform) {
-  const key = PLATFORM_CARD_ENV[platform];
-  const fromEnv = key ? String(process.env[key] || "").trim() : "";
-  if (fromEnv) return fromEnv;
-  if (PLATFORM_CARD_DEFAULT[platform]) return PLATFORM_CARD_DEFAULT[platform];
-  return getConfig().cardCode;
+  const key = canonicalPlatform(platform);
+  return key ? PLATFORM_CARD_DEFAULT[key] : "";
+}
+
+function cardCodesFor(platform) {
+  const key = canonicalPlatform(platform);
+  const aliases = {
+    Shopee: ["SHOPEE"],
+    TikTok: ["TIKTOK"],
+    Lazada: ["LAZADA"],
+  };
+  const codes = [cardCodeFor(platform), ...(aliases[key] || [])].map((code) => String(code || "").trim());
+  return [...new Set(codes.filter(Boolean))];
+}
+
+function cardCodeFilter(platform) {
+  return cardCodesFor(platform)
+    .map((code) => `CardCode eq '${odataString(code)}'`)
+    .join(" or ");
 }
 
 function isConfigured() {
@@ -65,11 +81,36 @@ async function login() {
   }
 
   const http = client();
-  const response = await http.post("/Login", {
-    CompanyDB: companyDb,
-    UserName: username,
-    Password: password,
-  });
+
+  let response;
+  try {
+    response = await http.post("/Login", {
+      CompanyDB: companyDb,
+      UserName: username,
+      Password: password,
+    });
+  } catch (error) {
+    const status = error.response?.status;
+    const data = error.response?.data;
+    const detail = data?.error;
+
+    const message =
+      (typeof detail?.message === "string"
+        ? detail.message
+        : detail?.message?.value) ||
+      (typeof data?.message === "string" ? data.message : null) ||
+      error.message;
+
+    console.error("SAP LOGIN ERROR:", {
+      status,
+      code: detail?.code,
+      message,
+    });
+
+    throw new Error(
+      `SAP Login failed: HTTP ${status || "unknown"} | ${message}`
+    );
+  }
 
   session = {
     sessionId: response.data && response.data.SessionId,
@@ -206,9 +247,15 @@ function isPlatformPlaceholder(item) {
 
 let masterCache = { at: 0, items: null };
 
+function clearCatalogCache() {
+  catalogGen += 1;
+  catalogCache = { at: 0, map: null };
+  catalogFlight = null;
+}
+
 function clearMasterCache() {
   masterCache = { at: 0, items: null };
-  catalogCache = { at: 0, map: null };
+  clearCatalogCache();
 }
 
 async function listMasterItems() {
@@ -260,16 +307,28 @@ async function listMasterItems() {
 }
 
 function sapErrorMessage(error, fallback) {
-  const sapMessage =
-    error.response &&
-    error.response.data &&
-    error.response.data.error &&
-    error.response.data.error.message &&
-    error.response.data.error.message.value;
-  return sapMessage || error.message || fallback;
+  const data = error.response?.data;
+  const status = error.response?.status;
+  const sapError = data?.error;
+
+  const message =
+    (typeof sapError?.message === "string"
+      ? sapError.message
+      : sapError?.message?.value) ||
+    data?.message ||
+    (typeof data === "string" ? data : null) ||
+    error.message ||
+    fallback;
+
+  const code = sapError?.code;
+  return [
+    status ? `HTTP ${status}` : null,
+    code != null ? `SAP Code ${code}` : null,
+    typeof message === "string" ? message : JSON.stringify(message),
+  ].filter(Boolean).join(" | ");
 }
 
-async function sapCall(method, path, { body, params } = {}) {
+async function sapCall(method, path, { body, params, headers } = {}) {
   if (!isConfigured()) {
     throw new Error("ยังไม่ได้ตั้งค่า SAP");
   }
@@ -281,21 +340,31 @@ async function sapCall(method, path, { body, params } = {}) {
       url: path,
       data: body,
       params,
-      headers: sessionHeaders(),
+      headers: { ...sessionHeaders(), ...(headers || {}) },
     });
 
   try {
     const { data } = await send();
     return data;
-  } catch (error) {
-    const status = error.response && error.response.status;
-    if (status === 401 || status === 301) {
-      await login();
-      const { data } = await send();
-      return data;
-    }
-    throw new Error(sapErrorMessage(error, "เรียก SAP ไม่สำเร็จ"));
+} catch (error) {
+  const status = error.response && error.response.status;
+
+  console.error("SAP API ERROR:", {
+    method,
+    path,
+    status,
+    sapResponse: error.response?.data,
+    message: error.message,
+  });
+
+  if (status === 401 || status === 301) {
+    await login();
+    const { data } = await send();
+    return data;
   }
+
+  throw new Error(sapErrorMessage(error, "เรียก SAP ไม่สำเร็จ"));
+}
 }
 
 async function listWarehouses() {
@@ -446,6 +515,8 @@ function describeSapMatch(sapItemCode) {
 }
 
 let catalogCache = { at: 0, map: null };
+let catalogGen = 0;
+let catalogFlight = null;
 
 function catalogCards() {
   const cards = new Set(Object.values(PLATFORM_CARD_DEFAULT));
@@ -460,10 +531,11 @@ async function fetchCatalogRows() {
   const filter = catalogCards().map((code) => `CardCode eq '${odataString(code)}'`).join(" or ");
   const rows = [];
   let path = "/AlternateCatNum";
-  let params = { $select: "ItemCode,CardCode,Substitute", $filter: filter };
+  let params = { $select: "ItemCode,CardCode", $filter: filter };
+  const headers = { Prefer: "odata.maxpagesize=1000" };
 
   while (path) {
-    const data = await sapCall("GET", path, { params });
+    const data = await sapCall("GET", path, { params, headers });
     for (const row of (data && data.value) || []) rows.push(row);
     const next = data && (data["odata.nextLink"] || data["@odata.nextLink"]);
     if (!next) break;
@@ -473,24 +545,40 @@ async function fetchCatalogRows() {
   return rows;
 }
 
-async function catalogIndex() {
-  if (catalogCache.map && Date.now() - catalogCache.at < 10 * 60 * 1000) {
-    return catalogCache.map;
-  }
+function indexCatalogRows(rows) {
   const map = new Map();
-  for (const row of await fetchCatalogRows()) {
+  for (const row of rows) {
     const card = String(row.CardCode || "").trim();
-    const sku = String(row.Substitute || "").trim();
     const itemCode = String(row.ItemCode || "").trim();
-    if (!card || !sku || !itemCode) continue;
-    const key = `${card}\0${sku}`;
+    if (!card || !itemCode) continue;
+    const key = `${card}\0${itemCode}`;
     const list = map.get(key) || [];
     if (!list.includes(itemCode)) list.push(itemCode);
     map.set(key, list);
   }
-
-  catalogCache = { at: Date.now(), map };
   return map;
+}
+
+async function catalogIndex() {
+  if (catalogCache.map && Date.now() - catalogCache.at < 10 * 60 * 1000) {
+    return catalogCache.map;
+  }
+  if (catalogFlight) return catalogFlight.promise;
+
+  const gen = catalogGen;
+  let flight;
+  const promise = fetchCatalogRows()
+    .then((rows) => {
+      const map = indexCatalogRows(rows);
+      if (gen === catalogGen) catalogCache = { at: Date.now(), map };
+      return map;
+    })
+    .finally(() => {
+      if (catalogFlight === flight) catalogFlight = null;
+    });
+  flight = { promise };
+  catalogFlight = flight;
+  return promise;
 }
 
 function platformFromForeign(value) {
@@ -502,7 +590,7 @@ function platformFromForeign(value) {
 }
 
 function catalogHits(map, platform, sku) {
-  // จับจาก BP Code + BP Catalog No. เท่านั้น ไม่ได้ค้นจากรหัสสินค้า
+  // จับจาก BP Code + Item No. เท่านั้น SKU จากร้านต้องตรงกับ ItemCode
   const card = cardCodeFor(platform);
   const code = String(sku || "").trim();
   if (!card || !code || code === "-") return [];
@@ -522,7 +610,7 @@ function catalogMissMessage(platform, sku, match) {
   if (match && match.problem && /มากกว่า 1/.test(match.problem)) {
     return `SKU ${code} ตรงกับรหัสสินค้าใน OSCN มากกว่า 1 รายการ ของ ${card}`;
   }
-  return `SKU ${code} ยังไม่ได้ผูกใน BP Catalog No. ของ ${card}`;
+  return `SKU ${code} ยังไม่ได้ผูกกับ Item No. ของ ${card}`;
 }
 
 async function matchFromCatalog(map, platform, sku) {
@@ -537,8 +625,8 @@ async function matchFromCatalog(map, platform, sku) {
   return describeSapMatch(hits[0] || null);
 }
 
-async function mapProduct(product) {
-  const catalog = await catalogIndex();
+async function mapProduct(product, catalogMap) {
+  const catalog = catalogMap || (await catalogIndex());
   const variants = await Promise.all(
     (product.variants || []).map(async (variant) => ({
       ...variant,
@@ -642,12 +730,21 @@ async function findSalesOrder(order) {
   try {
     rows = await load();
   } catch (error) {
-    const status = error.response && error.response.status;
+    const status = error.response?.status;
+
+    console.error("SAP FIND SO ERROR:", {
+      status,
+      message: sapErrorMessage(error, ""),
+      sapResponse: error.response?.data,
+    });
+
     if (status === 401 || status === 301) {
       await login();
       rows = await load();
     } else {
-      throw error;
+      throw new Error(
+        sapErrorMessage(error, "ค้นหา Sales Order ใน SAP ไม่สำเร็จ")
+      );
     }
   }
 
@@ -701,19 +798,59 @@ async function cancelSalesOrder(order) {
   return String(row.DocNum || row.DocEntry);
 }
 
-async function findDelivery(order) {
-  const cardCode = cardCodeFor(order.platform);
+function sapReadsAsDate(num) {
+  const text = String(num);
+  if (!/^\d{8}$/.test(text)) return false;
+  const month = Number(text.slice(4, 6));
+  const day = Number(text.slice(6, 8));
+  return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
+async function deliveryNoteByDocNum(docNum) {
+  const num = Number(String(docNum || "").trim());
+  if (!Number.isInteger(num) || num <= 0 || sapReadsAsDate(num)) return null;
+  let data;
+  try {
+    data = await sapCall("GET", "/DeliveryNotes", {
+      params: {
+        $select: "DocEntry,DocNum,Cancelled",
+        $filter: `DocNum eq ${num}`,
+        $top: 1,
+      },
+    });
+  } catch (error) {
+    if (/not a NUMBER|Query string/i.test(error.message || "")) return null;
+    throw error;
+  }
+  const row = ((data && data.value) || []).find((item) => String(item.Cancelled || "").toUpperCase() !== "TYES");
+  if (!row || row.DocEntry == null) return null;
+  return sapCall("GET", `/DeliveryNotes(${row.DocEntry})`);
+}
+
+async function findDeliveryDocument(order) {
+  const saved = await deliveryNoteByDocNum(order.deliveryDocNum || order.DeliveryDocNum);
+  if (saved) return saved;
+
+  const cards = cardCodeFilter(order.platform);
   const orderNo = String(order.marketplaceOrderId || "").trim();
-  if (!cardCode || !orderNo) return null;
+  if (!cards || !orderNo) return null;
   const data = await sapCall("GET", "/DeliveryNotes", {
     params: {
-      $select: "DocNum,DocEntry,Cancelled",
-      $filter: `NumAtCard eq '${odataString(orderNo)}' and CardCode eq '${odataString(cardCode)}'`,
+      $select: "DocNum,DocEntry,Cancelled,DocumentStatus",
+      $filter: `NumAtCard eq '${odataString(orderNo)}' and (${cards})`,
       $top: 5,
     },
   });
-  const rows = (data && data.value) || [];
-  const row = rows.find((item) => String(item.Cancelled || "").toUpperCase() !== "TYES") || null;
+  const rows = ((data && data.value) || []).filter(
+    (item) => String(item.Cancelled || "").toUpperCase() !== "TYES"
+  );
+  const row = rows.find((item) => String(item.DocumentStatus || "") === "bost_Open") || rows[0] || null;
+  if (!row || row.DocEntry == null) return null;
+  return sapCall("GET", `/DeliveryNotes(${row.DocEntry})`);
+}
+
+async function findDelivery(order) {
+  const row = await findDeliveryDocument(order);
   return row && (row.DocNum || row.DocEntry) ? String(row.DocNum || row.DocEntry) : null;
 }
 
@@ -722,14 +859,14 @@ async function createDelivery(order) {
   const existing = await findDelivery(order);
   if (existing) return existing;
 
-  const cardCode = cardCodeFor(order.platform);
+  const cards = cardCodeFilter(order.platform);
   const orderNo = String(order.marketplaceOrderId || "").trim();
-  if (!cardCode || !orderNo) return null;
+  if (!cards || !orderNo) return null;
 
   const data = await sapCall("GET", "/Orders", {
     params: {
-      $select: "DocNum,DocEntry,Cancelled,DocumentStatus,DocumentLines",
-      $filter: `NumAtCard eq '${odataString(orderNo)}' and CardCode eq '${odataString(cardCode)}'`,
+      $select: "DocNum,DocEntry,CardCode,Cancelled,DocumentStatus,DocumentLines",
+      $filter: `NumAtCard eq '${odataString(orderNo)}' and (${cards})`,
       $top: 5,
     },
   });
@@ -742,13 +879,36 @@ async function createDelivery(order) {
   const lines = (source.DocumentLines || [])
     .map((line) => ({
       lineNum: line.LineNum,
+      itemCode: String(line.ItemCode || "").trim(),
+      warehouse: String(line.WarehouseCode || "").trim(),
       quantity: Number(line.RemainingOpenQuantity != null ? line.RemainingOpenQuantity : line.Quantity) || 0,
     }))
     .filter((line) => line.lineNum != null && line.quantity > 0);
-  if (!lines.length) return findDelivery(order);
+  if (!lines.length) {
+    const already = await findDelivery(order);
+    if (already) return already;
+    throw new Error("Sales Order ไม่มีจำนวนค้างส่ง");
+  }
+
+  const shortages = [];
+  for (const line of lines) {
+    if (!line.itemCode || !line.warehouse) {
+      shortages.push(`บรรทัด ${line.lineNum} ไม่มีรหัสสินค้าหรือคลัง`);
+      continue;
+    }
+    const available = await warehouseStock(line.itemCode, line.warehouse);
+    if (available < line.quantity) {
+      shortages.push(
+        `${line.itemCode} คลัง ${line.warehouse} คงเหลือ ${available} ต้องการ ${line.quantity}`
+      );
+    }
+  }
+  if (shortages.length) {
+    throw new Error(`สต็อกไม่พอสำหรับ Delivery: ${shortages.join(" | ")}`);
+  }
 
   const payload = {
-    CardCode: cardCode,
+    CardCode: source.CardCode || cardCodeFor(order.platform),
     NumAtCard: orderNo.slice(0, 100),
     Comments: [order.platform, orderNo].filter(Boolean).join(" ").slice(0, 254),
     ...(await ensureMarketplaceFields(order)),
@@ -759,20 +919,38 @@ async function createDelivery(order) {
       Quantity: line.quantity,
     })),
   };
+  const docDate = sapDocDate(order.orderDate || order.OrderDate);
+  if (docDate) {
+    payload.DocDate = docDate;
+    payload.TaxDate = docDate;
+  }
 
-  const posted = await sapCall("POST", "/DeliveryNotes", { body: payload });
-  const docNum = posted && (posted.DocNum || posted.DocEntry);
-  return docNum ? String(docNum) : findDelivery(order);
+  const postDelivery = async (body) => {
+    const posted = await sapCall("POST", "/DeliveryNotes", { body });
+    const docNum = posted && (posted.DocNum || posted.DocEntry);
+    return docNum ? String(docNum) : findDelivery(order);
+  };
+
+  try {
+    return await postDelivery(payload);
+  } catch (error) {
+    const locked = /period|posting date|locked/i.test(error.message || "");
+    if (!payload.DocDate || !locked || order.keepDocDate) throw error;
+    const retry = { ...payload };
+    delete retry.DocDate;
+    delete retry.TaxDate;
+    return postDelivery(retry);
+  }
 }
 
 async function findReturnRequest(order) {
-  const cardCode = cardCodeFor(order.platform);
+  const cards = cardCodeFilter(order.platform);
   const orderNo = String(order.marketplaceOrderId || "").trim();
-  if (!cardCode || !orderNo) return null;
+  if (!cards || !orderNo) return null;
   const data = await sapCall("GET", "/ReturnRequest", {
     params: {
       $select: "DocNum,DocEntry,Cancelled",
-      $filter: `NumAtCard eq '${odataString(orderNo)}' and CardCode eq '${odataString(cardCode)}'`,
+      $filter: `NumAtCard eq '${odataString(orderNo)}' and (${cards})`,
       $top: 5,
     },
   });
@@ -798,13 +976,154 @@ async function loadBaseDocument(path, order) {
   return rows.find((item) => String(item.DocumentStatus || "") === "bost_Open") || rows[0] || null;
 }
 
-function copyLines(source) {
+function copyLines(source, { allowClosed = false } = {}) {
   return (source.DocumentLines || [])
-    .map((line) => ({
-      lineNum: line.LineNum,
-      quantity: Number(line.Quantity) || Number(line.RemainingOpenQuantity) || 0,
-    }))
+    .map((line) => {
+      const open = Number(line.RemainingOpenQuantity != null ? line.RemainingOpenQuantity : line.Quantity) || 0;
+      const qty = Number(line.Quantity) || 0;
+      return {
+        lineNum: line.LineNum,
+        quantity: open > 0 ? open : allowClosed ? qty : 0,
+        accountCode: String(line.AccountCode || "").trim(),
+      };
+    })
     .filter((line) => line.lineNum != null && line.quantity > 0);
+}
+
+let salesRevenueAccountCache;
+
+async function salesRevenueAccount() {
+  if (salesRevenueAccountCache !== undefined) return salesRevenueAccountCache;
+  try {
+    const group = await sapCall("GET", "/ItemGroups(105)", {
+      params: { $select: "RevenuesAccount" },
+    });
+    salesRevenueAccountCache = String((group && group.RevenuesAccount) || "").trim();
+  } catch (error) {
+    console.error(error);
+    salesRevenueAccountCache = "";
+  }
+  return salesRevenueAccountCache;
+}
+
+async function findInvoice(order) {
+  const cards = cardCodeFilter(order.platform);
+  const orderNo = String(order.marketplaceOrderId || "").trim();
+  if (!cards || !orderNo) return null;
+  const data = await sapCall("GET", "/Invoices", {
+    params: {
+      $select: "DocNum,DocEntry,Cancelled,DocumentStatus,DocumentLines",
+      $filter: `NumAtCard eq '${odataString(orderNo)}' and (${cards})`,
+      $top: 5,
+    },
+  });
+  const rows = ((data && data.value) || []).filter(
+    (item) => String(item.Cancelled || "").toUpperCase() !== "TYES"
+  );
+  return rows[0] || null;
+}
+
+async function createInvoiceFromDelivery(order) {
+  if (!isConfigured() || orderIsCancelled(order)) return null;
+  const existing = await findInvoice(order);
+  if (existing && (existing.DocNum || existing.DocEntry)) {
+    return {
+      docNum: String(existing.DocNum || existing.DocEntry),
+      docEntry: existing.DocEntry != null ? String(existing.DocEntry) : "",
+      existed: true,
+    };
+  }
+
+  const delivery = await findDeliveryDocument(order);
+  if (!delivery || delivery.DocEntry == null) throw new Error("ยังไม่มี Delivery สำหรับเปิด A/R Invoice");
+  const lines = copyLines(delivery, { allowClosed: true });
+  if (!lines.length) throw new Error("Delivery ไม่มีจำนวนค้างสำหรับเปิด Invoice");
+  const revenueAccount = lines.some((line) => !line.accountCode) ? await salesRevenueAccount() : "";
+
+  const posted = await sapCall("POST", "/Invoices", {
+    body: {
+      CardCode: delivery.CardCode || cardCodeFor(order.platform),
+      NumAtCard: String(order.marketplaceOrderId || "").slice(0, 100),
+      Comments: "",
+      JournalMemo: "",
+      DocumentLines: lines.map((line) => {
+        const row = {
+          BaseType: 15,
+          BaseEntry: delivery.DocEntry,
+          BaseLine: line.lineNum,
+          Quantity: line.quantity,
+        };
+        const account = line.accountCode || revenueAccount;
+        if (account) row.AccountCode = account;
+        return row;
+      }),
+    },
+  });
+  const docNum = posted && (posted.DocNum || posted.DocEntry);
+  const docEntry = posted && posted.DocEntry;
+  if (docEntry != null) {
+    try {
+      await sapCall("PATCH", `/Invoices(${docEntry})`, {
+        body: { Comments: "", JournalMemo: "" },
+      });
+    } catch (error) {
+      console.error(error);
+    }
+  }
+  if (!docNum) {
+    const again = await findInvoice(order);
+    if (!again) throw new Error("SAP ไม่คืนเลข A/R Invoice");
+    return {
+      docNum: String(again.DocNum || again.DocEntry),
+      docEntry: again.DocEntry != null ? String(again.DocEntry) : "",
+      existed: true,
+    };
+  }
+  return { docNum: String(docNum), docEntry: docEntry != null ? String(docEntry) : "", existed: false };
+}
+
+async function findCreditMemo(order) {
+  const cards = cardCodeFilter(order.platform);
+  const orderNo = String(order.marketplaceOrderId || "").trim();
+  if (!cards || !orderNo) return null;
+  const data = await sapCall("GET", "/CreditNotes", {
+    params: {
+      $select: "DocNum,DocEntry,Cancelled",
+      $filter: `NumAtCard eq '${odataString(orderNo)}' and (${cards})`,
+      $top: 5,
+    },
+  });
+  const rows = ((data && data.value) || []).filter(
+    (item) => String(item.Cancelled || "").toUpperCase() !== "TYES"
+  );
+  const row = rows[0];
+  return row && (row.DocNum || row.DocEntry) ? String(row.DocNum || row.DocEntry) : null;
+}
+
+// เก็บไว้สำหรับเฟสถัดไป ยังไม่ถูกเรียกจาก flow ปัจจุบัน
+async function createCreditMemoFromInvoice(order) {
+  if (!isConfigured()) return null;
+  const existing = await findCreditMemo(order);
+  if (existing) return existing;
+  const invoice = await findInvoice(order);
+  if (!invoice || invoice.DocEntry == null) return null;
+  const lines = copyLines(invoice);
+  if (!lines.length) return existing;
+  const posted = await sapCall("POST", "/CreditNotes", {
+    body: {
+      CardCode: invoice.CardCode || cardCodeFor(order.platform),
+      NumAtCard: String(order.marketplaceOrderId || "").slice(0, 100),
+      Comments: [order.platform, order.marketplaceOrderId, "A/R Credit Memo"].filter(Boolean).join(" ").slice(0, 254),
+      DocumentLines: lines.map((line) => ({
+        BaseType: 13,
+        BaseEntry: invoice.DocEntry,
+        BaseLine: line.lineNum,
+        Quantity: line.quantity,
+      })),
+    },
+  });
+  const docNum = posted && (posted.DocNum || posted.DocEntry);
+  return docNum ? String(docNum) : findCreditMemo(order);
 }
 
 async function createReturnRequest(order) {
@@ -816,20 +1135,21 @@ async function createReturnRequest(order) {
   const orderNo = String(order.marketplaceOrderId || "").trim();
   if (!cardCode || !orderNo) return null;
 
-  const delivery = await loadBaseDocument("/DeliveryNotes", order);
-  const source = delivery || (await loadBaseDocument("/Orders", order));
-  if (!source || source.DocEntry == null) return null;
-  const lines = copyLines(source);
-  if (!lines.length) return null;
+  const delivery = await findDeliveryDocument(order);
+  if (!delivery || delivery.DocEntry == null) {
+    throw new Error("ยังไม่มี Delivery จึงยังไม่เปิด Return Request");
+  }
+  const lines = copyLines(delivery);
+  if (!lines.length) throw new Error("Delivery ไม่มีจำนวนค้างสำหรับ Return Request");
 
   const payload = {
-    CardCode: cardCode,
+    CardCode: delivery.CardCode || cardCode,
     NumAtCard: orderNo.slice(0, 100),
-    Comments: [order.platform, orderNo].filter(Boolean).join(" ").slice(0, 254),
+    Comments: [order.platform, orderNo, "Return Request"].filter(Boolean).join(" ").slice(0, 254),
     ...(await ensureMarketplaceFields(order)),
     DocumentLines: lines.map((line) => ({
-      BaseType: delivery ? 15 : 17,
-      BaseEntry: source.DocEntry,
+      BaseType: 15,
+      BaseEntry: delivery.DocEntry,
       BaseLine: line.lineNum,
       Quantity: line.quantity,
     })),
@@ -1230,6 +1550,12 @@ async function runSapMap() {
 
 function startSapMapJob() {
   if (mapTimer) return;
+
+  if (process.env.SAP_MAP_AUTO !== "true") {
+    console.log("SAP item map job disabled (SAP_MAP_AUTO=false)");
+    return;
+  }
+
   if (!isConfigured()) {
     console.log("SAP item map job skipped (SAP is not configured)");
     return;
@@ -1345,6 +1671,8 @@ module.exports = {
   pushStoredProducts,
   startSapMapJob,
   clearMasterCache,
+  clearCatalogCache,
+  catalogIndex,
   listStockItems,
   listWarehouses,
   listInventoryTransferRequests,
@@ -1364,6 +1692,11 @@ module.exports = {
   cancelSalesOrder,
   orderIsCancelled,
   createSalesOrder,
+  findDelivery,
   createDelivery,
+  findInvoice,
+  createInvoiceFromDelivery,
+  findCreditMemo,
+  createCreditMemoFromInvoice,
   createReturnRequest,
 };

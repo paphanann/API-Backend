@@ -262,7 +262,7 @@ router.post("/", async (req, res) => {
     });
 
     const sapDoc = {
-      CardCode: sapService.cardCodeFor(platform),
+      CardCode: (await sapService.ensurePlatformCards(), sapService.cardCodeFor(platform)),
       DocDate: docDate,
       DueDate: docDate,
       FromWarehouse: fromWarehouse,

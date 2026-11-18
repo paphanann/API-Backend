@@ -670,29 +670,39 @@ async function fetchProducts(connection, options = {}) {
     });
 
     const list = (data && data.products) || [];
+    const active = [];
     for (const row of list) {
       const id = row && row.id;
       if (!id) continue;
-
       const rowStatus = String(row.status || "").toUpperCase();
       if (rowStatus && rowStatus !== "ACTIVATE") {
-        // ส่งต่อไปให้ syncEngine ลบออกจาก DB
         products.push(normalizeProduct(row));
         continue;
       }
+      active.push(row);
+    }
 
-      // search ไม่มี main_images — ต้องดึง detail ทีละชิ้น
-      let product = row;
-      try {
-        const detail = await fetchProductDetail(connection, id);
-        if (detail && detail.id) {
-          product = detail;
+    // search ไม่มี main_images — ดึง detail พร้อมกันทีละ 4 ชิ้น
+    const detailed = new Array(active.length);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(4, active.length) }, async () => {
+      while (cursor < active.length) {
+        const index = cursor;
+        cursor += 1;
+        const row = active[index];
+        let product = row;
+        try {
+          const detail = await fetchProductDetail(connection, row.id);
+          if (detail && detail.id) product = detail;
+        } catch (err) {
+          console.warn(`TikTok product detail ${row.id}:`, err.message || err);
         }
-      } catch (err) {
-        console.warn(`TikTok product detail ${id}:`, err.message || err);
+        detailed[index] = normalizeProduct(product);
       }
-
-      products.push(normalizeProduct(product));
+    });
+    await Promise.all(workers);
+    for (const product of detailed) {
+      if (product) products.push(product);
     }
 
     pageToken = data && data.next_page_token;

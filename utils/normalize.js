@@ -1,3 +1,13 @@
+const BANGKOK_OFFSET_MS = 7 * 60 * 60 * 1000;
+
+/** ค่า DATETIME ที่ไม่มีโซนเวลา — เก็บตัวเลขนาฬิกาไทย โดย driver ส่งส่วน UTC ของ Date */
+function toThaiWallDate(value) {
+  if (value == null || value === "") return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return new Date(date.getTime() + BANGKOK_OFFSET_MS);
+}
+
 function toDate(value) {
   if (value === undefined || value === null || value === "") {
     return null;
@@ -281,6 +291,7 @@ function publicError(error, fallback) {
 }
 
 module.exports = {
+  toThaiWallDate,
   toDate,
   expiryDate,
   isPlausibleTokenExpiry,

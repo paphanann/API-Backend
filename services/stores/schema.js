@@ -64,8 +64,30 @@ async function ensureSchema() {
         ALTER TABLE dbo.MarketplaceOrder ADD TrackingNo NVARCHAR(50) NULL;
       IF COL_LENGTH('dbo.MarketplaceOrder', 'DeliveryDocNum') IS NULL
         ALTER TABLE dbo.MarketplaceOrder ADD DeliveryDocNum NVARCHAR(50) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'NextRetryAt') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD NextRetryAt DATETIME2 NULL;
       IF COL_LENGTH('dbo.MarketplaceOrder', 'ReturnRequestDocNum') IS NULL
         ALTER TABLE dbo.MarketplaceOrder ADD ReturnRequestDocNum NVARCHAR(50) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'ShippingConfirmed') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD ShippingConfirmed BIT NOT NULL CONSTRAINT DF_MarketplaceOrder_ShippingConfirmed DEFAULT 0;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'InvoiceDocNum') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD InvoiceDocNum NVARCHAR(50) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'InvoiceDocEntry') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD InvoiceDocEntry NVARCHAR(50) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'InvoiceStatus') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD InvoiceStatus NVARCHAR(30) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'InvoiceError') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD InvoiceError NVARCHAR(500) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'SettlementStatus') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD SettlementStatus NVARCHAR(40) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'SettlementNote') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD SettlementNote NVARCHAR(300) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'ReturnStatus') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD ReturnStatus NVARCHAR(30) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'CreditDocNum') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD CreditDocNum NVARCHAR(50) NULL;
+      IF COL_LENGTH('dbo.MarketplaceOrder', 'ItemCount') IS NULL
+        ALTER TABLE dbo.MarketplaceOrder ADD ItemCount INT NULL;
     END
 
     IF OBJECT_ID(N'dbo.MarketplaceOrder', N'U') IS NOT NULL
@@ -183,6 +205,49 @@ async function ensureSchema() {
       SET IDENTITY_INSERT dbo.MarketplaceConnection OFF;
     END
 
+    IF OBJECT_ID(N'dbo.MarketplaceAuthorization', N'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.MarketplaceAuthorization
+      (
+        AuthorizationId INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        UserId INT NOT NULL,
+        Platform NVARCHAR(50) NOT NULL,
+        ShopId NVARCHAR(100) NULL,
+        ShopName NVARCHAR(255) NULL,
+        ShopCipher NVARCHAR(500) NULL,
+        SellerId NVARCHAR(200) NULL,
+        AccessToken NVARCHAR(MAX) NULL,
+        RefreshToken NVARCHAR(MAX) NULL,
+        AccessTokenExpiresAt DATETIME2 NULL,
+        RefreshTokenExpiresAt DATETIME2 NULL,
+        Scope NVARCHAR(MAX) NULL,
+        Status NVARCHAR(50) NOT NULL
+          CONSTRAINT DF_MarketplaceAuthorization_Status DEFAULT N'connected',
+        Company NVARCHAR(50) NULL,
+        LastRefreshAt DATETIME2 NULL,
+        NextRefreshAt DATETIME2 NULL,
+        TokenStatus VARCHAR(30) NULL,
+        LastError NVARCHAR(MAX) NULL,
+        AuthorizedAt DATETIME2 NULL,
+        LastSyncAt DATETIME2 NULL,
+        CreatedAt DATETIME2 NOT NULL
+          CONSTRAINT DF_MarketplaceAuthorization_CreatedAt DEFAULT GETDATE(),
+        UpdatedAt DATETIME2 NOT NULL
+          CONSTRAINT DF_MarketplaceAuthorization_UpdatedAt DEFAULT GETDATE()
+      );
+    END
+
+    IF COL_LENGTH('dbo.MarketplaceAuthorization', 'Company') IS NULL
+      ALTER TABLE dbo.MarketplaceAuthorization ADD Company NVARCHAR(50) NULL;
+    IF COL_LENGTH('dbo.MarketplaceAuthorization', 'LastRefreshAt') IS NULL
+      ALTER TABLE dbo.MarketplaceAuthorization ADD LastRefreshAt DATETIME2 NULL;
+    IF COL_LENGTH('dbo.MarketplaceAuthorization', 'NextRefreshAt') IS NULL
+      ALTER TABLE dbo.MarketplaceAuthorization ADD NextRefreshAt DATETIME2 NULL;
+    IF COL_LENGTH('dbo.MarketplaceAuthorization', 'TokenStatus') IS NULL
+      ALTER TABLE dbo.MarketplaceAuthorization ADD TokenStatus VARCHAR(30) NULL;
+    IF COL_LENGTH('dbo.MarketplaceAuthorization', 'LastError') IS NULL
+      ALTER TABLE dbo.MarketplaceAuthorization ADD LastError NVARCHAR(MAX) NULL;
+
     IF OBJECT_ID(N'dbo.AppSettings', N'U') IS NULL
     BEGIN
       CREATE TABLE dbo.AppSettings
@@ -250,6 +315,78 @@ async function ensureSchema() {
       CREATE UNIQUE INDEX UX_MarketplaceConnection_Company_Platform_Shop
         ON dbo.MarketplaceConnection (CompanyId, Platform, ShopId)
         WHERE CompanyId IS NOT NULL AND ShopId IS NOT NULL;
+
+    UPDATE a
+    SET
+      Company = LEFT(c.CompanyId, 50),
+      AccessToken = c.AccessToken,
+      RefreshToken = c.RefreshToken,
+      AccessTokenExpiresAt = c.AccessTokenExpiresAt,
+      RefreshTokenExpiresAt = c.RefreshTokenExpiresAt,
+      ShopCipher = COALESCE(c.ShopCipher, a.ShopCipher),
+      SellerId = COALESCE(c.SellerId, a.SellerId),
+      ShopName = COALESCE(c.ShopName, a.ShopName),
+      LastRefreshAt = c.LastRefreshAt,
+      NextRefreshAt = CASE
+        WHEN c.AccessTokenExpiresAt IS NULL THEN NULL
+        WHEN c.Platform = N'Shopee' THEN DATEADD(hour, -1, c.AccessTokenExpiresAt)
+        ELSE DATEADD(day, -1, c.AccessTokenExpiresAt)
+      END,
+      TokenStatus = CASE
+        WHEN c.RefreshTokenExpiresAt IS NOT NULL AND c.RefreshTokenExpiresAt <= SYSUTCDATETIME() THEN 'Expired'
+        WHEN c.AccessToken IS NULL OR LEN(c.AccessToken) = 0 THEN 'Expired'
+        ELSE 'Active'
+      END,
+      UpdatedAt = SYSUTCDATETIME()
+    FROM dbo.MarketplaceAuthorization AS a
+    INNER JOIN dbo.MarketplaceConnection AS c
+      ON c.Platform = a.Platform
+     AND ISNULL(c.ShopId, N'') = ISNULL(a.ShopId, N'');
+
+    INSERT INTO dbo.MarketplaceAuthorization
+    (
+      UserId, Platform, ShopId, ShopName, ShopCipher, SellerId,
+      AccessToken, RefreshToken, AccessTokenExpiresAt, RefreshTokenExpiresAt,
+      Status, Company, LastRefreshAt, NextRefreshAt, TokenStatus, LastError,
+      AuthorizedAt, LastSyncAt, CreatedAt, UpdatedAt
+    )
+    SELECT
+      COALESCE(c.UserId, 1),
+      c.Platform,
+      c.ShopId,
+      c.ShopName,
+      c.ShopCipher,
+      c.SellerId,
+      c.AccessToken,
+      c.RefreshToken,
+      c.AccessTokenExpiresAt,
+      c.RefreshTokenExpiresAt,
+      N'connected',
+      LEFT(c.CompanyId, 50),
+      c.LastRefreshAt,
+      CASE
+        WHEN c.AccessTokenExpiresAt IS NULL THEN NULL
+        WHEN c.Platform = N'Shopee' THEN DATEADD(hour, -1, c.AccessTokenExpiresAt)
+        ELSE DATEADD(day, -1, c.AccessTokenExpiresAt)
+      END,
+      CASE
+        WHEN c.RefreshTokenExpiresAt IS NOT NULL AND c.RefreshTokenExpiresAt <= SYSUTCDATETIME() THEN 'Expired'
+        WHEN c.AccessToken IS NULL OR LEN(c.AccessToken) = 0 THEN 'Expired'
+        ELSE 'Active'
+      END,
+      NULL,
+      c.AuthorizedAt,
+      c.LastSyncAt,
+      COALESCE(c.CreatedAt, SYSUTCDATETIME()),
+      SYSUTCDATETIME()
+    FROM dbo.MarketplaceConnection AS c
+    WHERE c.ShopId IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM dbo.MarketplaceAuthorization AS a
+        WHERE a.Platform = c.Platform
+          AND ISNULL(a.ShopId, N'') = ISNULL(c.ShopId, N'')
+      );
   `);
 
   await pool.request().query(`
@@ -316,6 +453,17 @@ async function ensureSchema() {
        )
       CREATE INDEX IX_MarketplaceOrder_OrderDate
         ON dbo.MarketplaceOrder (OrderDate DESC);
+
+    IF OBJECT_ID(N'dbo.MarketplaceOrder', N'U') IS NOT NULL
+       AND COL_LENGTH('dbo.MarketplaceOrder', 'CompanyId') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'IX_MarketplaceOrder_Company_OrderDate'
+           AND object_id = OBJECT_ID(N'dbo.MarketplaceOrder')
+       )
+      CREATE INDEX IX_MarketplaceOrder_Company_OrderDate
+        ON dbo.MarketplaceOrder (CompanyId, OrderDate DESC)
+        INCLUDE (Platform, ShopId, OrderStatus, SapDocNum, DeliveryDocNum, TotalAmount, MarketplaceOrderId);
 
     IF OBJECT_ID(N'dbo.MarketplaceConnection', N'U') IS NOT NULL
        AND NOT EXISTS (
@@ -468,9 +616,95 @@ async function ensureSchema() {
     END
   `);
 
+  await pool.request().query(`
+    IF OBJECT_ID(N'dbo.StockTransferOrder', N'U') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sys.indexes
+         WHERE name = N'IX_StockTransferOrder_SalesOrderId'
+           AND object_id = OBJECT_ID(N'dbo.StockTransferOrder')
+       )
+      CREATE INDEX IX_StockTransferOrder_SalesOrderId
+        ON dbo.StockTransferOrder (SalesOrderId)
+        INCLUDE (TransferId);
+  `);
+
+  await storeOrderDatesAsThaiTime(pool);
   await repairConnectionExpiries(pool);
 
+  await pool.request().query(`
+    IF COL_LENGTH('dbo.MarketplaceOrder', 'ShippingConfirmed') IS NOT NULL
+      UPDATE dbo.MarketplaceOrder
+      SET ShippingConfirmed = 1
+      WHERE ISNULL(ShippingConfirmed, 0) = 0
+        AND LOWER(REPLACE(REPLACE(LTRIM(RTRIM(ISNULL(PlatformStatus, N''))), N' ', N'_'), N'-', N'_')) IN (N'shipped', N'in_transit');
+
+    IF COL_LENGTH('dbo.MarketplaceOrder', 'ItemCount') IS NOT NULL
+      UPDATE dbo.MarketplaceOrder
+      SET ItemCount = CASE
+        WHEN ItemsJson IS NULL OR LEN(ItemsJson) < 3 THEN 0
+        ELSE 1 + (LEN(ItemsJson) - LEN(REPLACE(ItemsJson, N'},{', N''))) / 3
+      END
+      WHERE ItemCount IS NULL;
+  `);
+
   ensured = true;
+}
+
+async function storeOrderDatesAsThaiTime(pool) {
+  const result = await pool.request().query(`
+    DECLARE @lock int;
+    EXEC @lock = sp_getapplock
+      @Resource = N'MarketplaceOrder.OrderDate.Thai',
+      @LockMode = N'Exclusive',
+      @LockOwner = N'Session',
+      @LockTimeout = 120000;
+
+    IF @lock < 0
+      THROW 50001, N'OrderDate clock lock failed', 1;
+
+    DECLARE @shifted int = 0;
+
+    BEGIN TRY
+      IF OBJECT_ID(N'dbo.MarketplaceOrder', N'U') IS NOT NULL
+         AND COL_LENGTH('dbo.MarketplaceOrder', 'OrderDate') IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM sys.extended_properties
+           WHERE name = N'Clock'
+             AND major_id = OBJECT_ID(N'dbo.MarketplaceOrder')
+             AND minor_id = COLUMNPROPERTY(OBJECT_ID(N'dbo.MarketplaceOrder'), N'OrderDate', 'ColumnId')
+         )
+      BEGIN
+        UPDATE dbo.MarketplaceOrder
+        SET OrderDate = DATEADD(HOUR, 7, OrderDate)
+        WHERE OrderDate IS NOT NULL;
+
+        SET @shifted = @@ROWCOUNT;
+
+        EXEC sys.sp_addextendedproperty
+          @name = N'Clock',
+          @value = N'Asia/Bangkok',
+          @level0type = N'SCHEMA', @level0name = N'dbo',
+          @level1type = N'TABLE', @level1name = N'MarketplaceOrder',
+          @level2type = N'COLUMN', @level2name = N'OrderDate';
+      END
+
+      EXEC sp_releaseapplock
+        @Resource = N'MarketplaceOrder.OrderDate.Thai',
+        @LockOwner = N'Session';
+    END TRY
+    BEGIN CATCH
+      EXEC sp_releaseapplock
+        @Resource = N'MarketplaceOrder.OrderDate.Thai',
+        @LockOwner = N'Session';
+      THROW;
+    END CATCH
+
+    SELECT @shifted AS shifted;
+  `);
+  const shiftedRow = (result.recordsets || []).map((set) => set && set[0]).find((row) => row && Object.prototype.hasOwnProperty.call(row, "shifted"));
+  const shifted = shiftedRow ? Number(shiftedRow.shifted) || 0 : 0;
+  if (shifted) console.log(`OrderDate stored as Thai time: ${shifted} rows`);
 }
 
 function sameInstant(next, prev) {

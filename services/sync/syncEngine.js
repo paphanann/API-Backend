@@ -1,4 +1,4 @@
-const connectionStore = require("../stores/connectionStore");
+﻿const connectionStore = require("../stores/connectionStore");
 const orderStore = require("../stores/orderStore");
 const productStore = require("../stores/productStore");
 const syncLogStore = require("../stores/syncLogStore");
@@ -23,6 +23,22 @@ function sapDocArgs(order) {
 
 async function rememberSapDoc(order, docNum) {
   await orderStore.setSapDoc(order.platform, order.marketplaceOrderId, docNum, "sap_ok", order.shopId, order.companyId);
+}
+
+async function rememberCancelledSalesOrder(order) {
+  if (!sapService.isConfigured() || !sapService.orderIsCancelled(order)) return { status: "skipped" };
+  const existing = String(order.sapDocNum || order.SapDocNum || "").trim() || (await sapService.findSalesOrder(order));
+  if (!existing) {
+    await orderStore.deferSapLookup(order);
+    return { status: "skipped" };
+  }
+  try {
+    await sapService.cancelSalesOrder(order);
+  } catch (error) {
+    console.warn(`SAP cancel ${order.marketplaceOrderId}:`, error.message);
+  }
+  await rememberSapDoc(order, existing);
+  return { status: "ok", docNum: existing };
 }
 
 async function pushToSap(order) {
@@ -75,8 +91,95 @@ async function pushToSap(order) {
   }
 }
 
-const SAP_SO_STATUSES = new Set(["ready_to_ship", "on_hold", "pending", "cancelled", "canceled"]);
+async function postDelivery(order, options = {}) {
+  if (process.env.SAP_DELIVERY_AUTO !== "true") {
+    return { status: "skipped", reason: "delivery-auto-disabled" };
+  }
 
+  const allowed = options.recovery ? confirmedShipping(order) : allowsDelivery(order);
+
+  if (!sapService.isConfigured() || !allowed || sapService.orderIsCancelled(order)) {
+    return { status: "skipped" };
+  }
+
+  if (confirmedShipping(order)) {
+    await orderStore.markShippingConfirmed(order);
+    order.shippingConfirmed = true;
+  }
+
+  const sapDocNum = String(order.sapDocNum || order.SapDocNum || "").trim();
+  const deliveryDocNum = String(order.deliveryDocNum || order.DeliveryDocNum || "").trim();
+  if (!sapDocNum || deliveryDocNum) {
+    if (!deliveryDocNum || String(order.invoiceDocNum || order.InvoiceDocNum || "").trim()) {
+      return { status: "skipped" };
+    }
+    const invoice = await postInvoice(order);
+    return { status: "ok", docNum: deliveryDocNum, existed: true, invoice };
+  }
+
+  const claim = await orderStore.claimDeliverySend(order);
+  if (!claim.claimed) {
+    if (!claim.deliveryDocNum) return { status: "skipped" };
+    order.deliveryDocNum = claim.deliveryDocNum;
+    const invoice = await postInvoice(order);
+    return { status: "ok", docNum: claim.deliveryDocNum, existed: true, invoice };
+  }
+
+  try {
+    const existing = await sapService.findDelivery(order);
+    if (existing) {
+      await orderStore.finishDelivery(order, existing);
+      order.deliveryDocNum = existing;
+      const invoice = await postInvoice(order);
+      return { status: "ok", docNum: existing, recovered: true, invoice };
+    }
+    const docNum = await sapService.createDelivery(order);
+    const savedNum = docNum || (await sapService.findDelivery(order));
+    if (!savedNum) throw new Error("SAP ไม่คืนเลข Delivery");
+    await orderStore.finishDelivery(order, savedNum);
+    order.deliveryDocNum = savedNum;
+    const invoice = await postInvoice(order);
+    return { status: "ok", docNum: savedNum, invoice };
+  } catch (error) {
+    const recovered = await sapService.findDelivery(order).catch(() => null);
+    if (recovered) {
+      await orderStore.finishDelivery(order, recovered);
+      order.deliveryDocNum = recovered;
+      const invoice = await postInvoice(order);
+      return { status: "ok", docNum: recovered, recovered: true, invoice };
+    }
+    await orderStore.failDelivery(order);
+    return { status: "error", message: publicError(error, "SAP delivery error") };
+  }
+}
+
+async function recoverStoredOrder(order) {
+  const sapDocNum = String(order.sapDocNum || "").trim();
+  if (!sapDocNum && sapService.orderIsCancelled(order)) return rememberCancelledSalesOrder(order);
+  if (!sapDocNum && allowsSalesOrder(order)) return pushToSap(order);
+
+  let deliveryDocNum = String(order.deliveryDocNum || "").trim();
+  if (sapDocNum && !deliveryDocNum && confirmedShipping(order) && !sapService.orderIsCancelled(order)) {
+    const delivery = await postDelivery(order, { recovery: true });
+    if (delivery.status === "error") return delivery;
+    deliveryDocNum = String(order.deliveryDocNum || delivery.docNum || "").trim();
+  }
+
+  if (deliveryDocNum && !String(order.invoiceDocNum || "").trim()) {
+    const invoice = await postInvoice(order);
+    if (!allowsReturnRequest(order)) return invoice;
+  }
+  if (allowsReturnRequest(order)) return postReturn(order);
+  return { status: "skipped" };
+}
+
+const SAP_SO_STATUSES = new Set([
+  "ready_to_ship",
+  "on_hold",
+  "pending",
+  "awaiting_shipment",
+  "awaiting_collection"
+]);
 function platformStatusKey(order) {
   return String(order.platformStatus || order.PlatformStatus || "")
     .trim()
@@ -88,16 +191,130 @@ function allowsSalesOrder(order) {
   return SAP_SO_STATUSES.has(platformStatusKey(order));
 }
 
-const DELIVERY_STATUSES = new Set(["shipped", "in_transit"]);
+const DELIVERY_STATUSES = new Set([
+  "shipped",
+  "in_transit",
+  "to_confirm_receive",
+  "completed",
+  "complete",
+  "delivered",
+  "success",
+  "สำเร็จ",
+]);
 
 function allowsDelivery(order) {
+  if (process.env.SAP_DELIVERY_AUTO !== "true") {
+    return false;
+  }
+
   return DELIVERY_STATUSES.has(platformStatusKey(order));
 }
+
 
 const RETURN_REQUEST_STATUSES = new Set(["to_return", "returned", "จัดส่งไม่สำเร็จ"]);
 
 function allowsReturnRequest(order) {
   return RETURN_REQUEST_STATUSES.has(platformStatusKey(order));
+}
+
+const CONFIRMED_LATER = new Set([
+  "completed",
+  "complete",
+  "delivered",
+  "shipped",
+  "in_transit",
+  "success",
+  "สำเร็จ",
+  "to_confirm_receive",
+]);
+
+function confirmedShipping(order) {
+  if (order.shippingConfirmed || Number(order.ShippingConfirmed) === 1) return true;
+  if (allowsDelivery(order)) return true;
+  const track = String(order.trackingNo || order.TrackingNo || "").trim();
+  return Boolean(track && track !== "-" && CONFIRMED_LATER.has(platformStatusKey(order)));
+}
+
+function settlementDecision(order) {
+  const pay = String(order.paymentMethod || order.PaymentMethod || "").toLowerCase();
+  const cod = /cod|cash on delivery|เก็บเงินปลายทาง/.test(pay);
+  return {
+    settlementStatus: "waiting_marketplace",
+    settlementNote: cod
+      ? "COD ยังไม่ยืนยันยอดเก็บเงิน ค่าธรรมเนียม และรอบรับเงิน จึงยังไม่บันทึกรับชำระ"
+      : "Prepaid ยังไม่ยืนยันค่าธรรมเนียมและรอบรับเงินจาก Marketplace จึงยังไม่บันทึกรับชำระ",
+  };
+}
+
+async function postInvoice(order) {
+  if (process.env.SAP_INVOICE_AUTO !== "true") {
+    return { status: "skipped", reason: "invoice-auto-disabled" };
+  }
+
+  if (!sapService.isConfigured() || sapService.orderIsCancelled(order)) return { status: "skipped" };
+  if (String(order.invoiceDocNum || order.InvoiceDocNum || "").trim()) return { status: "ok", existed: true };
+  const settlement = settlementDecision(order);
+  try {
+    const invoice = await sapService.createInvoiceFromDelivery(order);
+    if (!invoice || !invoice.docNum) throw new Error("SAP ไม่คืนเลข A/R Invoice");
+    await orderStore.saveInvoice(order, {
+      docNum: invoice.docNum,
+      docEntry: invoice.docEntry,
+      status: "ok",
+      error: null,
+      ...settlement,
+    });
+    order.invoiceDocNum = invoice.docNum;
+    return { status: "ok", docNum: invoice.docNum };
+  } catch (error) {
+    const message = publicError(error, "SAP invoice error");
+    await orderStore.saveInvoice(order, { status: "error", error: message, ...settlement });
+    return { status: "error", message };
+  }
+}
+
+async function postReturn(order) {
+  if (process.env.SAP_RETURN_AUTO !== "true") {
+    return { status: "skipped", reason: "return-auto-disabled" };
+  }
+
+  if (!sapService.isConfigured() || !allowsReturnRequest(order) || sapService.orderIsCancelled(order)) {
+    return { status: "skipped" };
+  }
+  try {
+    let deliveryNum = String(order.deliveryDocNum || order.DeliveryDocNum || "").trim();
+    if (!deliveryNum) deliveryNum = (await sapService.findDelivery(order)) || "";
+    if (!deliveryNum) {
+      await orderStore.saveReturnState(order, { status: "review" });
+      return { status: "review", message: "ยังไม่มี Delivery จึงยังไม่เปิด Return Request" };
+    }
+    if (!String(order.deliveryDocNum || "").trim()) {
+      await orderStore.finishDelivery(order, deliveryNum);
+      order.deliveryDocNum = deliveryNum;
+    }
+
+    let returnDoc = String(order.returnRequestDocNum || "").trim();
+    if (!returnDoc) {
+      try {
+        returnDoc = (await sapService.createReturnRequest(order)) || "";
+      } catch (error) {
+        const message = publicError(error, "SAP return error");
+        if (!/ไม่มีจำนวนค้าง|closed|base document/i.test(message)) {
+          await orderStore.saveReturnState(order, { status: "error" });
+          return { status: "error", message };
+        }
+      }
+    }
+    if (!returnDoc) {
+      await orderStore.saveReturnState(order, { status: "review" });
+      return { status: "review", message: "มี Delivery แล้ว แต่ยังเปิด Return Request ไม่ได้" };
+    }
+    await orderStore.saveReturnState(order, { status: "created", returnDocNum: returnDoc });
+    return { status: "ok", docNum: returnDoc };
+  } catch (error) {
+    await orderStore.saveReturnState(order, { status: "error" });
+    return { status: "error", message: publicError(error, "SAP return error") };
+  }
 }
 
 function shouldCreateSalesOrder(order, result) {
@@ -270,14 +487,11 @@ async function syncConnectedShop(platform, connection, options = {}) {
             nextUnchanged += 1;
           }
 
-          // สร้าง SO เมื่อสถานะเป็น READY_TO_SHIP, ON_HOLD, pending หรือ CANCELLED
+          // สร้าง SO เมื่อสถานะเป็น READY_TO_SHIP, ON_HOLD หรือ pending ใบที่ยกเลิกแล้วไม่เปิด SO ใหม่
           if (!shouldCreateSalesOrder(order, result)) {
-            if (result.sapDocNum && sapService.orderIsCancelled(order)) {
-              try {
-                await sapService.cancelSalesOrder(order);
-              } catch (error) {
-                console.warn(`SAP cancel ${order.marketplaceOrderId}:`, error.message);
-              }
+            if (sapService.orderIsCancelled(order)) {
+              const saved = await rememberCancelledSalesOrder({ ...order, sapDocNum: result.sapDocNum || order.sapDocNum });
+              if (saved.docNum) result.sapDocNum = saved.docNum;
             } else if (result.sapDocNum && result.change === "updated") {
               try {
                 await sapService.patchSalesOrderFields({ ...order, sapDocNum: result.sapDocNum });
@@ -313,40 +527,72 @@ async function syncConnectedShop(platform, connection, options = {}) {
               });
             }
           }
+        }
 
-          if (allowsDelivery(order) && result.sapDocNum && !result.deliveryDocNum && !sapService.orderIsCancelled(order)) {
-            try {
-              const deliveryNum = await sapService.createDelivery(order);
-              if (deliveryNum) {
-                await orderStore.setDeliveryDoc(
-                  order.platform,
-                  order.marketplaceOrderId,
-                  deliveryNum,
-                  order.shopId,
-                  order.companyId
-                );
-                result.deliveryDocNum = deliveryNum;
-              }
-            } catch (error) {
-              console.warn(`SAP delivery ${order.marketplaceOrderId}:`, error.message);
-            }
+        for (let index = 0; index < visibleOrders.length; index += 1) {
+          const order = visibleOrders[index];
+          const result = saved[index];
+          if (!order.marketplaceOrderId || !result) continue;
+          if (result.sapDocNum) order.sapDocNum = result.sapDocNum;
+          if (result.deliveryDocNum) order.deliveryDocNum = result.deliveryDocNum;
+
+          const delivery = await postDelivery(order);
+          if (delivery.status === "ok" && delivery.docNum) {
+            result.deliveryDocNum = delivery.docNum;
+            order.deliveryDocNum = delivery.docNum;
+          } else if (delivery.status === "error") {
+            nextSapError += 1;
+            await syncLogStore.writeDetail({
+              connectionId: connection.id,
+              platform,
+              parentSyncRunId: syncRunId,
+              status: "error",
+              message: `Delivery ไม่สำเร็จ: ${delivery.message || "error"}`,
+              errorMessage: delivery.message || null,
+              marketplaceOrderId: order.marketplaceOrderId,
+              sapDocNum: order.sapDocNum || null,
+            });
           }
 
-          if (allowsReturnRequest(order) && !result.returnRequestDocNum) {
-            try {
-              const returnNum = await sapService.createReturnRequest(order);
-              if (returnNum) {
-                await orderStore.setReturnRequestDoc(
-                  order.platform,
-                  order.marketplaceOrderId,
-                  returnNum,
-                  order.shopId,
-                  order.companyId
-                );
-                result.returnRequestDocNum = returnNum;
-              }
-            } catch (error) {
-              console.warn(`SAP return request ${order.marketplaceOrderId}:`, error.message);
+          let invoice = delivery.invoice;
+          if (
+            (!invoice || invoice.status === "skipped") &&
+            String(order.deliveryDocNum || "").trim() &&
+            !String(order.invoiceDocNum || order.InvoiceDocNum || "").trim()
+          ) {
+            invoice = await postInvoice(order);
+          }
+          if (invoice && invoice.status === "ok" && invoice.docNum) {
+            order.invoiceDocNum = invoice.docNum;
+            result.invoiceDocNum = invoice.docNum;
+          } else if (invoice && invoice.status === "error") {
+            nextSapError += 1;
+            await syncLogStore.writeDetail({
+              connectionId: connection.id,
+              platform,
+              parentSyncRunId: syncRunId,
+              status: "error",
+              message: `A/R Invoice ไม่สำเร็จ: ${invoice.message || "error"}`,
+              errorMessage: invoice.message || null,
+              marketplaceOrderId: order.marketplaceOrderId,
+              sapDocNum: order.sapDocNum || null,
+            });
+          }
+
+          if (allowsReturnRequest(order)) {
+            const returned = await postReturn(order);
+            if (returned.status === "error") {
+              nextSapError += 1;
+              await syncLogStore.writeDetail({
+                connectionId: connection.id,
+                platform,
+                parentSyncRunId: syncRunId,
+                status: "error",
+                message: `Return Request ไม่สำเร็จ: ${returned.message || "error"}`,
+                errorMessage: returned.message || null,
+                marketplaceOrderId: order.marketplaceOrderId,
+                sapDocNum: order.sapDocNum || null,
+              });
             }
           }
         }
@@ -378,6 +624,10 @@ async function syncConnectedShop(platform, connection, options = {}) {
 
         if (options.forceProducts && shopId) {
           await productStore.deleteMissing(platform, keptIds, shopId);
+        }
+
+        if (sapService.isConfigured()) {
+          sapService.clearCatalogCache();
         }
 
         if (sapService.isConfigured() && keptIds.length) {
@@ -614,7 +864,7 @@ async function resendSalesOrder(row) {
   if (!allowsSalesOrder(order)) {
     return {
       status: "error",
-      message: "สร้าง Sales Order ได้เมื่อสถานะเป็น READY_TO_SHIP, ON_HOLD, pending หรือ CANCELLED",
+      message: "สร้าง Sales Order ได้เมื่อสถานะเป็น READY_TO_SHIP, ON_HOLD หรือ pending",
     };
   }
   return pushToSap(order);
@@ -624,6 +874,7 @@ module.exports = {
   syncPlatform,
   postStoredSalesOrders,
   resendSalesOrder,
+  recoverStoredOrder,
   syncAllConnected: async () => {
     const { syncAllConnected } = require("./orderSyncJob");
     return syncAllConnected();

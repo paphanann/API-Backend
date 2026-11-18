@@ -11,7 +11,6 @@ const services = {
 };
 
 const DEFAULT_INTERVAL_MS = 15 * 60 * 1000;
-const DEFAULT_SKEW_MS = 60 * 60 * 1000;
 
 let timer = null;
 let running = false;
@@ -21,9 +20,8 @@ function intervalMs() {
   return Number.isFinite(raw) && raw >= 60_000 ? raw : DEFAULT_INTERVAL_MS;
 }
 
-function skewMs() {
-  const raw = Number(process.env.TOKEN_REFRESH_SKEW_MS || DEFAULT_SKEW_MS);
-  return Number.isFinite(raw) && raw >= 60_000 ? raw : DEFAULT_SKEW_MS;
+function skewFor(platform) {
+  return tokenService.refreshSkewMs(platform);
 }
 
 async function refreshDueConnections() {
@@ -32,7 +30,6 @@ async function refreshDueConnections() {
   }
 
   running = true;
-  const skew = skewMs();
   const summary = { checked: 0, refreshed: 0, skipped: 0, failed: 0, errors: [] };
 
   try {
@@ -62,6 +59,12 @@ async function refreshDueConnections() {
       summary.checked += 1;
 
       if (tokenService.needsReconnect(connection)) {
+        await tokenService.markTokenState({
+          platform,
+          shopId: connection.shopId,
+          tokenStatus: "Expired",
+          lastError: "Refresh Token หมดอายุ ต้องเชื่อมต่อใหม่",
+        });
         summary.skipped += 1;
         console.warn(
           `Token auto-refresh skip ${platform} shop=${connection.shopId || "-"}: refresh token expired, reconnect required`
@@ -69,7 +72,7 @@ async function refreshDueConnections() {
         continue;
       }
 
-      if (!tokenService.needsRefresh(connection.accessTokenExpireAt, skew)) {
+      if (!tokenService.needsRefresh(connection.accessTokenExpireAt, skewFor(platform))) {
         summary.skipped += 1;
         continue;
       }
@@ -82,6 +85,12 @@ async function refreshDueConnections() {
         );
       } catch (error) {
         summary.failed += 1;
+        await tokenService.markTokenState({
+          platform,
+          shopId: connection.shopId,
+          tokenStatus: "Error",
+          lastError: error.message,
+        });
         summary.errors.push(`${platform} ${connection.shopId || ""}: ${error.message}`);
         console.error(
           `Token auto-refresh failed: ${platform} shop=${connection.shopId || "-"} -> ${error.message}`
@@ -103,7 +112,7 @@ function startTokenRefreshJob() {
 
   const every = intervalMs();
   console.log(
-    `Token auto-refresh job started (every ${Math.round(every / 60000)} min, skew ${Math.round(skewMs() / 60000)} min)`
+    `Token auto-refresh job started (every ${Math.round(every / 60000)} min; Shopee ≤1 h, Lazada ≤1 day, TikTok ≤1 day)`
   );
 
   // รอบแรกหลังบูตเล็กน้อย — ไม่บล็อก listen

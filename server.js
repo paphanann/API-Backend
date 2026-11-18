@@ -1,4 +1,5 @@
 const path = require("path");
+const zlib = require("zlib");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 
@@ -23,6 +24,7 @@ const lazadaService = require("./services/marketplaces/lazadaService");
 const { ensureSchema } = require("./services/stores/schema");
 const { startTokenRefreshJob } = require("./services/sync/tokenRefreshJob");
 const { startOrderSyncJob } = require("./services/sync/orderSyncJob");
+const { startSapRecoveryJob } = require("./services/sync/sapRecoveryJob");
 const { startSapMapJob } = require("./services/marketplaces/sapService");
 const dashboardRoutes = require("./routes/dashboardRoutes");
 const { poolPromise } = require("./config/database");
@@ -74,6 +76,29 @@ app.use(
 
 
 app.use(express.json());
+app.use((req, res, next) => {
+  const accept = String(req.headers["accept-encoding"] || "");
+  if (!/\bgzip\b/.test(accept)) return next();
+  const sendJson = res.json.bind(res);
+  res.json = (body) => {
+    let raw;
+    try {
+      raw = JSON.stringify(body);
+    } catch (error) {
+      return sendJson(body);
+    }
+    if (raw.length < 32768 || res.headersSent) return sendJson(body);
+    zlib.gzip(Buffer.from(raw), (error, zipped) => {
+      if (error || res.headersSent) return sendJson(body);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Encoding", "gzip");
+      res.setHeader("Vary", "Accept-Encoding");
+      res.setHeader("Content-Length", zipped.length);
+      res.end(zipped);
+    });
+  };
+  next();
+});
 app.use(requireAuth);
 
 // ngrok free บางทีโชว์หน้าเตือนจน OAuth callback พัง — ข้ามสำหรับ path callback
@@ -155,6 +180,7 @@ app.listen(PORT, "0.0.0.0", () => {
  if (process.env.ENABLE_BACKGROUND_JOBS === "true") {
   startTokenRefreshJob();
   startOrderSyncJob();
+  startSapRecoveryJob();
   startSapMapJob();
 }
 });

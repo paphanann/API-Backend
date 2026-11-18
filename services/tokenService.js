@@ -5,6 +5,32 @@ const { currentCompanyId } = require("./stores/companyContext");
 const { isPlausibleTokenExpiry } = require("../utils/normalize");
 
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const PLATFORM_REFRESH_SKEW_MS = {
+  Shopee: HOUR_MS,
+  Lazada: DAY_MS,
+  TikTok: DAY_MS,
+};
+
+function refreshSkewMs(platform) {
+  return PLATFORM_REFRESH_SKEW_MS[platform] || HOUR_MS;
+}
+
+function nextRefreshAt(platform, accessTokenExpireAt) {
+  if (!accessTokenExpireAt) return null;
+  const time = new Date(accessTokenExpireAt).getTime();
+  if (!Number.isFinite(time)) return null;
+  return new Date(time - refreshSkewMs(platform));
+}
+
+function tokenStatusFor(refreshTokenExpireAt, hasAccess) {
+  if (!hasAccess) return "Expired";
+  if (refreshTokenExpireAt && new Date(refreshTokenExpireAt).getTime() <= Date.now()) {
+    return "Expired";
+  }
+  return "Active";
+}
 
 function encryptToken(plainText) {
   return encrypt(plainText);
@@ -102,10 +128,16 @@ function keepExpiry(next, prev) {
 }
 
 async function applyRefresh(connection, payload) {
+  const accessToken = payload.accessToken || "";
+  if (!accessToken) {
+    throw new Error("รีเฟรชโทเค็นไม่สำเร็จ ไม่ได้รับ Access Token ใหม่");
+  }
+
+  const refreshToken = payload.refreshToken || connection.refreshToken;
   const next = {
     ...connection,
-    accessToken: payload.accessToken || connection.accessToken,
-    refreshToken: payload.refreshToken || connection.refreshToken,
+    accessToken,
+    refreshToken,
     accessTokenExpireAt: keepExpiry(payload.accessTokenExpireAt, connection.accessTokenExpireAt),
     refreshTokenExpireAt: keepExpiry(payload.refreshTokenExpireAt, connection.refreshTokenExpireAt),
     shopCipher: payload.shopCipher || connection.shopCipher,
@@ -206,6 +238,12 @@ async function saveTokens({
     .input("refreshExpire", sql.DateTime2, refreshTokenExpireAt || null)
     .input("shopCipher", sql.NVarChar(500), shopCipher || null)
     .input("markRefreshed", sql.Bit, markRefreshed ? 1 : 0)
+    .input("nextRefresh", sql.DateTime2, nextRefreshAt(key.platform, accessTokenExpireAt))
+    .input(
+      "tokenStatus",
+      sql.VarChar(30),
+      tokenStatusFor(refreshTokenExpireAt, Boolean(accessToken))
+    )
     .query(`
       DECLARE @id INT =
       (
@@ -227,12 +265,72 @@ async function saveTokens({
         AccessToken = @accessToken,
         RefreshToken = COALESCE(@refreshToken, RefreshToken),
         AccessTokenExpiresAt = @accessExpire,
-        RefreshTokenExpiresAt = @refreshExpire,
+        RefreshTokenExpiresAt = COALESCE(@refreshExpire, RefreshTokenExpiresAt),
         ShopCipher = COALESCE(@shopCipher, ShopCipher),
         ConnectionStatus = N'CONNECTED',
-        LastRefreshAt = CASE WHEN @markRefreshed = 1 THEN GETDATE() ELSE LastRefreshAt END,
-        UpdatedAt = GETDATE()
+        LastRefreshAt = CASE WHEN @markRefreshed = 1 THEN SYSUTCDATETIME() ELSE LastRefreshAt END,
+        UpdatedAt = SYSUTCDATETIME()
       WHERE ConnectionId = @id;
+
+      DECLARE @authId INT =
+      (
+        SELECT TOP 1 AuthorizationId
+        FROM dbo.MarketplaceAuthorization
+        WHERE Platform = @platform
+          AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
+        ORDER BY UpdatedAt DESC, AuthorizationId DESC
+      );
+
+      IF @authId IS NULL
+      BEGIN
+        INSERT INTO dbo.MarketplaceAuthorization
+        (
+          UserId, Platform, ShopId, ShopName, ShopCipher, SellerId,
+          AccessToken, RefreshToken, AccessTokenExpiresAt, RefreshTokenExpiresAt,
+          Status, Company, AuthorizedAt, LastRefreshAt, NextRefreshAt, TokenStatus, LastError,
+          CreatedAt, UpdatedAt
+        )
+        SELECT
+          COALESCE(c.UserId, 1),
+          @platform,
+          @shopId,
+          c.ShopName,
+          COALESCE(@shopCipher, c.ShopCipher),
+          c.SellerId,
+          @accessToken,
+          COALESCE(@refreshToken, c.RefreshToken),
+          @accessExpire,
+          COALESCE(@refreshExpire, c.RefreshTokenExpiresAt),
+          N'connected',
+          LEFT(@companyId, 50),
+          COALESCE(c.AuthorizedAt, SYSUTCDATETIME()),
+          CASE WHEN @markRefreshed = 1 THEN SYSUTCDATETIME() ELSE c.LastRefreshAt END,
+          @nextRefresh,
+          @tokenStatus,
+          NULL,
+          SYSUTCDATETIME(),
+          SYSUTCDATETIME()
+        FROM dbo.MarketplaceConnection AS c
+        WHERE c.ConnectionId = @id;
+      END
+      ELSE
+      BEGIN
+        UPDATE dbo.MarketplaceAuthorization
+        SET
+          AccessToken = @accessToken,
+          RefreshToken = COALESCE(@refreshToken, RefreshToken),
+          AccessTokenExpiresAt = @accessExpire,
+          RefreshTokenExpiresAt = COALESCE(@refreshExpire, RefreshTokenExpiresAt),
+          ShopCipher = COALESCE(@shopCipher, ShopCipher),
+          Company = LEFT(@companyId, 50),
+          Status = N'connected',
+          TokenStatus = @tokenStatus,
+          LastRefreshAt = CASE WHEN @markRefreshed = 1 THEN SYSUTCDATETIME() ELSE LastRefreshAt END,
+          NextRefreshAt = @nextRefresh,
+          LastError = NULL,
+          UpdatedAt = SYSUTCDATETIME()
+        WHERE AuthorizationId = @authId;
+      END
     `);
 
   const rowsUpdated = Number((updated.rowsAffected && updated.rowsAffected[0]) || 0);
@@ -263,7 +361,7 @@ async function saveTokens({
 
   console.log(
     `Saved marketplace tokens: ${key.platform} shop=${key.shopId}` +
-      ` access=yes refresh=${verify.HasRefreshToken ? "yes" : "no"}` +
+      ` access=updated refresh=${sealedRefresh ? "updated" : "kept"}` +
       ` expire=${verify.AccessTokenExpiresAt || "-"}`
   );
 
@@ -336,10 +434,23 @@ async function clearTokens(platform, shopId) {
         AccessTokenExpiresAt = NULL,
         RefreshTokenExpiresAt = NULL,
         ConnectionStatus = N'DISCONNECTED',
-        UpdatedAt = GETDATE()
+        UpdatedAt = SYSUTCDATETIME()
       WHERE Platform = @platform
         AND ISNULL(CompanyId, N'') = ISNULL(@companyId, N'')
-        ${shopFilter}
+        ${shopFilter};
+
+      UPDATE dbo.MarketplaceAuthorization
+      SET
+        AccessToken = NULL,
+        RefreshToken = NULL,
+        AccessTokenExpiresAt = NULL,
+        RefreshTokenExpiresAt = NULL,
+        NextRefreshAt = NULL,
+        Status = N'disconnected',
+        TokenStatus = 'Expired',
+        UpdatedAt = SYSUTCDATETIME()
+      WHERE Platform = @platform
+        ${shopFilter};
     `);
 
   console.log(`Cleared marketplace connection: ${platform}${shopId ? ` shop=${shopId}` : ""}`);
@@ -354,9 +465,32 @@ function revealTokens(row) {
   };
 }
 
+async function markTokenState({ platform, shopId, tokenStatus, lastError }) {
+  await ensureSchema();
+  const key = shopKey(platform, shopId);
+  const pool = await poolPromise;
+  await pool
+    .request()
+    .input("platform", sql.NVarChar(50), key.platform)
+    .input("shopId", sql.NVarChar(100), key.shopId)
+    .input("tokenStatus", sql.VarChar(30), tokenStatus)
+    .input("lastError", sql.NVarChar(sql.MAX), lastError || null)
+    .query(`
+      UPDATE dbo.MarketplaceAuthorization
+      SET
+        TokenStatus = @tokenStatus,
+        LastError = @lastError,
+        Status = CASE WHEN @tokenStatus = 'Active' THEN N'connected' ELSE N'expired' END,
+        UpdatedAt = SYSUTCDATETIME()
+      WHERE Platform = @platform
+        AND ISNULL(ShopId, N'') = ISNULL(@shopId, N'')
+    `);
+}
+
 module.exports = {
   encryptToken,
   decryptToken,
+  refreshSkewMs,
   needsRefresh,
   needsReconnect,
   isAuthError,
@@ -369,6 +503,7 @@ module.exports = {
   saveTokens,
   loadTokens,
   clearTokens,
+  markTokenState,
   revealTokens,
   RECONNECT_MESSAGE,
 };

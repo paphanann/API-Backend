@@ -295,7 +295,10 @@ async function ensureFreshTokens(connection, options = {}) {
   }
 
   try {
-    const tokens = await refreshAccessToken(connection);
+    const tokens = unwrapShopeeToken(await refreshAccessToken(connection));
+    if (!tokens || !tokens.access_token) {
+      throw new Error("Shopee ไม่ได้ส่ง Access Token ใหม่กลับมา");
+    }
     return tokenService.applyRefresh(connection, {
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,

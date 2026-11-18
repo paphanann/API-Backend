@@ -293,6 +293,14 @@ async function importTokenPayload(payload) {
   };
 }
 
+function earlierExpiry(current, incoming) {
+  const times = [current, incoming]
+    .map((value) => (value ? new Date(value).getTime() : NaN))
+    .filter((time) => Number.isFinite(time));
+  if (!times.length) return null;
+  return new Date(Math.min(...times));
+}
+
 async function ensureFreshTokens(connection, options = {}) {
   tokenService.assertLiveToken(connection.accessToken);
 
@@ -312,15 +320,17 @@ async function ensureFreshTokens(connection, options = {}) {
   try {
     const tokens = await refreshAccessToken(connection.refreshToken);
     const payload = tokens && (tokens.access_token ? tokens : tokens.data);
+    const returnedRefreshExpiry = expiryDate(
+      payload && (payload.refresh_expires_in || payload.refresh_expire_in)
+    );
     return tokenService.applyRefresh(connection, {
       accessToken: payload && payload.access_token,
       refreshToken: payload && payload.refresh_token,
       accessTokenExpireAt: expiryDate(
         (payload && (payload.expires_in || payload.expire_in)) || tokens.expires_in
       ),
-      refreshTokenExpireAt: expiryDate(
-        payload && (payload.refresh_expires_in || payload.refresh_expire_in)
-      ),
+      // Lazada ไม่ยืดเส้นตายของ Refresh Token ออกไปอีก 180 วัน
+      refreshTokenExpireAt: earlierExpiry(connection.refreshTokenExpireAt, returnedRefreshExpiry),
     });
   } catch (error) {
     if (tokenService.isRefreshRejected(error) || tokenService.isAuthError(error)) {

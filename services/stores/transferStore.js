@@ -189,6 +189,23 @@ async function listTransfers(companyId) {
   return headers.recordset.map((row) => shape(row, lineMap.get(Number(row.Id)) || [], orderMap.get(Number(row.Id)) || []));
 }
 
+function bestTransferLinks(rows) {
+  const map = new Map();
+  const rank = { success: 3, pending: 2, failed: 1 };
+  for (const row of rows) {
+    const key = String(row.SalesOrderId || "");
+    if (!key) continue;
+    const prev = map.get(key);
+    if (!prev || (rank[row.Status] || 0) > (rank[prev.status] || 0)) {
+      map.set(key, {
+        status: row.Status,
+        docNum: row.SapDocNum || row.DocumentNo || "",
+      });
+    }
+  }
+  return map;
+}
+
 async function linksForOrders(companyId) {
   await ensureSchema();
   const pool = await poolPromise;
@@ -199,19 +216,25 @@ async function linksForOrders(companyId) {
     WHERE ISNULL(t.CompanyId, N'') = ISNULL(@companyId, N'')
       AND t.Status IN (N'pending', N'success', N'failed')
   `);
-  const map = new Map();
-  const rank = { success: 3, pending: 2, failed: 1 };
-  for (const row of result.recordset) {
-    const key = String(row.SalesOrderId || "");
-    const prev = map.get(key);
-    if (!prev || (rank[row.Status] || 0) > (rank[prev.status] || 0)) {
-      map.set(key, {
-        status: row.Status,
-        docNum: row.SapDocNum || row.DocumentNo || "",
-      });
-    }
-  }
-  return map;
+  return bestTransferLinks(result.recordset);
+}
+
+async function linksForKeys(companyId, keys) {
+  const list = [...new Set((keys || []).map((key) => String(key || "").trim()).filter(Boolean))];
+  if (!list.length) return new Map();
+  await ensureSchema();
+  const pool = await poolPromise;
+  const request = pool.request().input("companyId", sql.NVarChar(100), await companyOf(companyId));
+  list.forEach((id, index) => request.input(`k${index}`, sql.NVarChar(100), id));
+  const result = await request.query(`
+    SELECT l.SalesOrderId, t.Status, t.SapDocNum, t.DocumentNo
+    FROM dbo.StockTransferOrder l
+    INNER JOIN dbo.StockTransfer t ON t.Id = l.TransferId
+    WHERE ISNULL(t.CompanyId, N'') = ISNULL(@companyId, N'')
+      AND t.Status IN (N'pending', N'success', N'failed')
+      AND l.SalesOrderId IN (${list.map((_, index) => `@k${index}`).join(", ")})
+  `);
+  return bestTransferLinks(result.recordset);
 }
 
 async function findOpenDocument(companyId, documentNo) {
@@ -275,4 +298,5 @@ module.exports = {
   setResult,
   listTransfers,
   linksForOrders,
+  linksForKeys,
 };

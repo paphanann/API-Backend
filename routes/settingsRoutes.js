@@ -37,19 +37,36 @@ function listSqlDatabases({ host, port, username, password }) {
       }
 
       const request = new Request(
-        "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0 ORDER BY name",
+        `SELECT LTRIM(RTRIM(dbName)) AS name, LTRIM(RTRIM(cmpName)) AS companyName
+         FROM [SBO-COMMON].dbo.SRGC
+         WHERE NULLIF(LTRIM(RTRIM(dbName)), N'') IS NOT NULL
+         ORDER BY cmpName, dbName`,
         (queryError) => {
           connection.close();
           if (queryError) {
+            const detail = String(queryError.message || "");
+            if (/SBO-COMMON|Invalid object name/i.test(detail)) {
+              reject(
+                new Error(
+                  "เซิร์ฟเวอร์นี้ไม่มีรายชื่อบริษัท SAP ต้องใช้ SQL Server เครื่องเดียวกับหน้า Choose Company"
+                )
+              );
+              return;
+            }
             reject(queryError);
             return;
           }
-          resolve(names.map((name) => ({ name })));
+          resolve(names);
         }
       );
       request.on("row", (columns) => {
-        const value = columns[0] && columns[0].value;
-        if (value) names.push(String(value));
+        const name = columns[0] && columns[0].value;
+        const companyName = columns[1] && columns[1].value;
+        if (!name) return;
+        names.push({
+          name: String(name),
+          companyName: companyName ? String(companyName) : String(name),
+        });
       });
       connection.execSql(request);
     });

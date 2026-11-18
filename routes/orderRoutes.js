@@ -38,7 +38,20 @@ router.get("/:id", async (req, res) => {
 router.get("/", async (req, res) => {
   try {
     const platform = normalizePlatform(req.query.platform);
-    const rows = await orderStore.listOrders(platform);
+    const page = Number(req.query.page);
+    const rows = await orderStore.listOrders(platform, null, {
+      from: req.query.from,
+      to: req.query.to,
+      page: Number.isFinite(page) && page > 0 ? page : 0,
+      pageSize: req.query.pageSize,
+      status: req.query.status,
+      sap: req.query.sap,
+      q: req.query.q,
+      shopId: req.query.shopId,
+      tr: req.query.tr,
+      wide: req.query.wide === "1" || req.query.wide === "true",
+      links: req.query.links === "1" || req.query.links === "true",
+    });
     res.json(rows);
   } catch (error) {
     console.error(error);
